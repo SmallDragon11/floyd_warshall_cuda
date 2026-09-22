@@ -1,0 +1,14 @@
+# CUDA 編譯產物
+*.exe
+*.obj
+*.o
+*.pdb
+
+# Nsight Systems 報告資料
+*.nsys-rep
+*.qdrep
+*.sqlite
+
+# 編輯器與暫存檔
+.vscode/
+__pycache__/
