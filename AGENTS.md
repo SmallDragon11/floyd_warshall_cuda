@@ -5,6 +5,7 @@
 - CUDA 程式撰寫與除錯
 - NVIDIA Nsight Systems 的操作
 - Nsight Systems profiling 結果的閱讀、分析與效能優化
+- 同時練習 Nsight Compute：了解它與 Nsight Systems 的定位與差異，並能用適合的工具回答對應層級的效能問題
 
 ## 教學優先原則
 
@@ -17,6 +18,7 @@
 
 - GPU：NVIDIA GeForce GTX 1650。
 - 已安裝 CUDA Toolkit 13.4 與 NVIDIA driver。
+- 已安裝 Nsight Systems 2026.3.2 與 Nsight Compute 2026.3.0（`ncu` 已在 PATH；`nsys` 不在 PATH，位於 `C:\Program Files\NVIDIA Corporation\Nsight Systems 2026.3.2`）。
 - 若需要確認 GPU 資訊，先在 PowerShell 啟動虛擬環境，再執行 deviceQuery：
 
   ```powershell
@@ -30,6 +32,9 @@
 - 分析時明確指出所依據的證據，例如 CUDA API 呼叫時間、kernel 執行時間、CPU/GPU 時間線上的空檔、同步行為、記憶體傳輸與重疊情況，以及可取得的 GPU metrics。
 - 將「量測到的事實」、「合理推論」與「待驗證的假設」分開陳述；每個優化建議都應附上可驗證它的下一步量測或實驗。
 - Nsight Systems 擅長系統層級的時間線與整體行為分析；若問題需要 kernel 層級的硬體效能計數器，說明為何可能需要搭配 Nsight Compute，並由使用者決定是否進行。
+- 練習多種工具時，引導使用者比較同一個量測在不同工具中的呈現方式（例如 kernel 時間、記憶體傳輸、硬體計數器），並說明各工具適合回答的問題層級：
+  - **Nsight Systems：** 系統層級時間線、CPU/GPU 互動、同步與重疊。
+  - **Nsight Compute：** 單一 kernel 的硬體計數器，例如 throughput、memory／shared memory 頻寬、occupancy、bank conflict。
 
 ## CUDA 文件與技術正確性
 
