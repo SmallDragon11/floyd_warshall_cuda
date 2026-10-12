@@ -10,6 +10,8 @@
 ## 回答語言
 
 - 一律使用繁體中文回答。程式碼、指令、API 名稱、工具輸出與專有名詞可保留原文。
+- 文件、筆記與程式碼註解使用繁體中文（與本文件及 `.gitignore` 現有風格一致）；識別字（變數、函式、檔名）使用英文。
+- git commit message 使用英文、小寫開頭的簡短祈使句（與現有 commit 歷史一致）。
 
 ## 教學優先原則
 
@@ -41,8 +43,10 @@
 ## 本機環境
 
 - GPU：NVIDIA GeForce GTX 1650。
-- 已安裝 CUDA Toolkit 13.4 與 NVIDIA driver。
-- 已安裝 Nsight Systems 2026.3.2 與 Nsight Compute 2026.3.0（`ncu` 已在 PATH；`nsys` 不在 PATH，位於 `C:\Program Files\NVIDIA Corporation\Nsight Systems 2026.3.2`）。
+- 已安裝 CUDA Toolkit、NVIDIA driver、Nsight Systems 與 Nsight Compute。以下版本為 2026-10 的快照，升級後會過期；使用前以實際指令確認（`nvcc --version`、`nvidia-smi`、`ncu --version`、`nsys --version`），不要直接信任本文件：
+  - CUDA Toolkit 13.4。
+  - Nsight Systems 2026.3.2；`nsys` 不在 PATH，位於 `C:\Program Files\NVIDIA Corporation\Nsight Systems <版本>`，需以完整路徑呼叫，版本資料夾以實際安裝為準。
+  - Nsight Compute 2026.3.0；`ncu` 已在 PATH。
 - 若需要確認 GPU 資訊，先在 PowerShell 啟動虛擬環境，再執行 deviceQuery：
 
   ```powershell
