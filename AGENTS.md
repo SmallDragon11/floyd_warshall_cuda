@@ -27,7 +27,14 @@
 
 ## 專案背景
 
-- 本目錄是 Floyd-Warshall 全點對最短路徑的 CUDA 練習，題目規格為 `PP_2018_HW4_rev3.pdf`（平行程式設計課程作業 4）。
+- 本目錄是 Blocked Floyd-Warshall（全點對最短路徑）的 CUDA 練習，題目規格為 `PP_2018_HW4_rev3.pdf`（CS542200 Parallel Programming 作業 4，2018）。
+- 規格重點（細節以 PDF 為準）：
+  - 演算法：blocked APSP，每輪分 3 個 phase（pivot block → pivot row／column → 其餘 block），blocking factor 為可調參數。
+  - 輸入：二進位檔，依序為 V、E，接著 E 組 (src, dst, weight)（皆 32-bit int）；0 ≤ weight ≤ 100；單 GPU 版 V ≤ 20000，多 GPU 版 V ≤ 50000。
+  - 輸出：V×V 個 32-bit int 的最短距離，對角線為 0，無路徑為 `1000000000`。
+  - 三個版本：單 GPU（`apsp.cu`）、單機雙 GPU（`mutli_gpu.cu`，OpenMP／stream）、MPI 雙節點（`multi_node.cu`）；執行格式 `./exe <input> <output>`。
+  - 報告要求 profiling 結果，並分析 blocking factor 對 Integer GOPS 與 device／shared memory 頻寬的影響，以及各項優化（bank conflict、shared memory、occupancy、streaming、unroll 等）。
+- 本機只有一張 GTX 1650：可做單 GPU 版與 Nsight 練習；多 GPU／MPI 版無法在本機實測，相關問題以概念引導為主，並明說未經實測。
 - 目前目錄只有規格與本文件；原始碼、建置方式與 profiling 報告的存放位置尚未定案，建立時請與使用者確認後補在此節。
 - `.gitignore` 已忽略編譯產物（`*.exe`、`*.obj` 等）與 Nsight Systems 報告（`*.nsys-rep`、`*.qdrep`、`*.sqlite`）；Nsight Compute 報告（`*.ncu-rep`）目前未被忽略，產生前先與使用者確認是否要加入。
 
