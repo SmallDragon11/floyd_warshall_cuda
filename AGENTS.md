@@ -47,8 +47,12 @@
 - 本機只有一張 GTX 1650：可做單 GPU 版與 Nsight 練習；多 GPU／MPI 版無法在本機實測，相關問題以概念引導為主，並明說未經實測。
 - 本專案範圍（已與使用者確認）：只實作 Single-GPU 版（`apsp.cu`）；`mutli_gpu.cu`、`multi_node.cu` 不實作，僅做概念討論（資料切分、pivot row／column 交換等）。
   - 報告中只適用於多 GPU 的項目（weak scalability）略過；time distribution 的 communication 一項在單 GPU 版接近 0，於報告中說明原因即可。
-- 待定事項：原始碼、建置方式與 profiling 報告的存放位置尚未定案，建立時請與使用者確認後補在此節。
-- `.gitignore` 已忽略編譯產物（`*.exe`、`*.obj` 等）與 Nsight Systems 報告（`*.nsys-rep`、`*.qdrep`、`*.sqlite`）；Nsight Compute 報告（`*.ncu-rep`）目前未被忽略，產生前先與使用者確認是否要加入。
+- 目錄配置：原始碼放 `src/`，profiling 報告放 `reports/`，編譯產物輸出到 `build/`。
+- 建置：使用根目錄的 `build.ps1`（不用 Makefile；本機沒有 `make`，且本專案不交作業）。
+  - 預設把 `src/apsp.cu` 編成 `build/apsp.exe`；`-Define BF=64` 會轉成 `-DBF=64`，`-Source`／`-Output` 可換檔案。
+  - `nvcc` 在 Windows 需要 MSVC 的 `cl.exe`；若 PATH 中沒有，腳本會用 `vswhere.exe` 找到 Visual Studio（目前裝在 D 槽）並呼叫 `Launch-VsDevShell.ps1` 載入環境。
+  - 固定參數：`-arch=sm_75`、`-lineinfo`、`-res-usage`、`-Xcompiler /utf-8`（系統 code page 為 950，不加會出現大量 C4819 警告）。
+- `.gitignore` 已忽略編譯產物（`*.exe`、`*.obj`、`build/` 等）、Nsight Systems 報告（`*.nsys-rep`、`*.qdrep`、`*.sqlite`）與 Nsight Compute 報告（`*.ncu-rep`）；報告要用的數據改存截圖或匯出的 CSV。
 
 ## 本機環境
 
