@@ -3,10 +3,12 @@
 #   .\build.ps1                         # 編譯 src/apsp.cu
 #   .\build.ps1 -Define BF=64           # 等同在程式中 #define BF 64
 #   .\build.ps1 -Source src/foo.cu -Output build/foo.exe
+#   .\build.ps1 -Source tools/ref.cpp -Output build/ref.exe -HostFlags /O2,/openmp
 param(
     [string]$Source = "src/apsp.cu",
     [string]$Output = "build/apsp.exe",
-    [string[]]$Define = @()
+    [string[]]$Define = @(),
+    [string[]]$HostFlags = @()   # 每項轉成 -Xcompiler <flag> 傳給 cl.exe
 )
 
 $ErrorActionPreference = "Stop"
@@ -30,7 +32,7 @@ $nvccArgs = @(
     "-res-usage",             # 編譯時印出每個 kernel 的 register／shared memory 用量
     "-Xcompiler", "/utf-8",   # cl.exe 以 UTF-8 讀原始碼，避免 C4819 與中文註解亂碼
     "-o", $Output
-) + ($Define | ForEach-Object { "-D$_" }) + @($Source)
+) + ($Define | ForEach-Object { "-D$_" }) + ($HostFlags | ForEach-Object { "-Xcompiler", $_ }) + @($Source)
 
 Write-Host "nvcc $($nvccArgs -join ' ')"
 & nvcc @nvccArgs

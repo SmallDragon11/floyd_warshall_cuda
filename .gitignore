@@ -16,3 +16,5 @@ build/
 # 編輯器與暫存檔
 .vscode/
 __pycache__/
+# 測資（可用 tools/make_testcases.ps1 重新產生）
+testcases/

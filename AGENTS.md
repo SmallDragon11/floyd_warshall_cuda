@@ -45,8 +45,11 @@
 - 專案範圍（已與使用者確認）：本機只有單張 GPU，只實作單 GPU 版（`apsp.cu`）；`mutli_gpu.cu`、`multi_node.cu` 不實作，僅做概念討論（資料切分、pivot row／column 交換等），並明說未經實測。
   - 報告略過只適用於多 GPU 的項目（weak scalability）；time distribution 的 communication 在單 GPU 版接近 0，於報告中說明原因即可。
 - 目錄配置：原始碼放 `src/`，profiling 報告放 `reports/`，編譯產物輸出到 `build/`。
+  - `src/graph_io.h`：規格格式的二進位讀寫（agent 代寫），`apsp.cu` 與工具共用。
+  - `tools/`：agent 代寫的 CPU 工具——`gen.cpp`（隨機測資）、`ref.cpp`（CPU 參考答案）、`cmp.cpp`（比對輸出），以及 `make_testcases.ps1`（編譯工具並產生測資）。
+  - `testcases/`：測資（`cXX.in/.out` 為正確性測資，`pXX.in` 為只量效能的大測資），不進 git，可用 `make_testcases.ps1` 重新產生。
 - 建置：使用根目錄的 `build.ps1`（不用 Makefile；本機沒有 `make`，且本專案不交作業）。
-  - 預設把 `src/apsp.cu` 編成 `build/apsp.exe`；`-Define BF=64` 會轉成 `-DBF=64`，`-Source`／`-Output` 可換檔案。
+  - 預設把 `src/apsp.cu` 編成 `build/apsp.exe`；`-Define BF=64` 會轉成 `-DBF=64`，`-Source`／`-Output` 可換檔案，`-HostFlags /O2,/openmp` 會逐項轉成 `-Xcompiler <flag>`。
   - `nvcc` 在 Windows 需要 MSVC 的 `cl.exe`；若 PATH 中沒有，腳本會用 `vswhere.exe` 找到 Visual Studio（目前裝在 D 槽）並呼叫 `Launch-VsDevShell.ps1` 載入環境。
   - 固定參數：`-arch=sm_75`、`-lineinfo`、`-res-usage`、`-Xcompiler /utf-8`（系統 code page 為 950，不加會出現大量 C4819 警告）。
 - `.gitignore` 已忽略編譯產物（`*.exe`、`*.obj`、`build/` 等）、Nsight Systems 報告（`*.nsys-rep`、`*.qdrep`、`*.sqlite`）與 Nsight Compute 報告（`*.ncu-rep`）；報告要用的數據改存截圖或匯出的 CSV。
