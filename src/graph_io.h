@@ -30,16 +30,21 @@ inline void read_graph(const char* path, int& V, std::vector<Edge>& edges) {
     std::fclose(f);
 }
 
-// 把邊轉成 V*V 的距離矩陣（列優先，dist[i*V + j]）：對角線 0、無邊 INF
-// 重複的邊取最小權重
-inline std::vector<int> make_dist_matrix(int V, const std::vector<Edge>& edges) {
-    std::vector<int> dist((size_t)V * V, INF);
-    for (int i = 0; i < V; ++i) dist[(size_t)i * V + i] = 0;
+// 把邊轉成 n*n 的距離矩陣（n >= V，列優先，dist[i*n + j]）：真實點對角線 0、其餘無邊為 INF
+// 重複的邊取最小權重；n > V 時多出的虛擬點與任何點都不相連（整列、整欄皆為 INF）
+inline std::vector<int> make_dist_matrix(int V, const std::vector<Edge>& edges, int n) {
+    std::vector<int> dist((size_t)n * n, INF);
+    for (int i = 0; i < V; ++i) dist[(size_t)i * n + i] = 0;
     for (const Edge& e : edges) {
-        int& d = dist[(size_t)e.src * V + e.dst];
+        int& d = dist[(size_t)e.src * n + e.dst];
         if (e.w < d) d = e.w;
     }
     return dist;
+}
+
+// 不補齊的版本：V*V
+inline std::vector<int> make_dist_matrix(int V, const std::vector<Edge>& edges) {
+    return make_dist_matrix(V, edges, V);
 }
 
 // 寫出 V*V 個 int32；dist 的每列長度為 ld（ld >= V，多出的欄位不會寫出）
