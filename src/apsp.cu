@@ -29,7 +29,21 @@ constexpr int BLOCK_Y = 4;
 
 // 第 r 輪的 phase 1：pivot block (r, r)
 __global__ void phase1(int* d, int n, int r) {
-    // TODO
+    int x = r * BF + threadIdx.x;
+    int y_start = r * BF + threadIdx.y;
+    int y_end = (r + 1) * BF;
+    int k_start = r * BF;
+    int k_end = (r + 1) * BF;
+
+    for (int k = k_start; k < k_end; k++) {
+        const int &d_kx = d[k * n + x];
+        for (int y = y_start; y < y_end; y += BLOCK_Y) {
+            int * const d_y = d + y * n;
+            int &d_yx = d_y[x];
+            d_yx = min(d_yx, d_y[k] + d_kx);
+        }
+        __syncthreads();
+    }
 }
 
 // 第 r 輪的 phase 2：pivot row 與 pivot column 上的 block
@@ -64,7 +78,12 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_dist, bytes));
     CUDA_CHECK(cudaMemcpy(d_dist, h_dist.data(), bytes, cudaMemcpyHostToDevice));
 
-    // TODO：共 rounds 輪，每輪依序 launch phase1、phase2、phase3
+    dim3 block(BF, BLOCK_Y);
+    for (int r = 0; r < rounds; r++) {
+        phase1<<<1, block>>>(d_dist, n, r);
+        // TODO: phase2
+        // TODO: phase3
+    }
 
     CUDA_CHECK(cudaGetLastError());  // 檢查 kernel launch 是否失敗（例如 blockDim 超過上限）
     CUDA_CHECK(cudaMemcpy(h_dist.data(), d_dist, bytes, cudaMemcpyDeviceToHost));
