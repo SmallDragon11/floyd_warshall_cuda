@@ -80,7 +80,30 @@ __global__ void phase2(int* d, int n, int r, int rounds) {
 
 // 第 r 輪的 phase 3：其餘 block
 __global__ void phase3(int* d, int n, int r) {
-    // TODO
+    int tileNoX = blockIdx.x;
+    int tileNoY = blockIdx.y;
+    if (tileNoX >= r) {
+        tileNoX += 1;
+    }
+    if (tileNoY >= r) {
+        tileNoY += 1;
+    }
+    
+    int x = tileNoX * BF + threadIdx.x;
+    int y_start = tileNoY * BF + threadIdx.y;
+    int y_end = (tileNoY + 1) * BF;
+
+    int k_start = r * BF;
+    int k_end = (r + 1) * BF;
+
+    for (int k = k_start; k < k_end; k++) {
+        int d_kx = d[k * n + x];
+        for (int y = y_start; y < y_end; y += BLOCK_Y) {
+            int * const d_y = d + y * n;
+            int &d_yx = d_y[x];
+            d_yx = min(d_yx, d_y[k] + d_kx);
+        }
+    }
 }
 
 int main(int argc, char** argv) {
@@ -106,12 +129,12 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemcpy(d_dist, h_dist.data(), bytes, cudaMemcpyHostToDevice));
 
     dim3 block(BF, BLOCK_Y);
-    dim3 grid2(2*rounds-2);
+    dim3 grid2(2*rounds-2), grid3(rounds-1, rounds-1);
     if (rounds > 1) {
         for (int r = 0; r < rounds; r++) {
             phase1<<<1, block>>>(d_dist, n, r);
             phase2<<<grid2, block>>>(d_dist, n, r, rounds);
-            // TODO: phase3
+            phase3<<<grid3, block>>>(d_dist, n, r);
         }
     } else {
         phase1<<<1, block>>>(d_dist, n, 0);
