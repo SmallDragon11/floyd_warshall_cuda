@@ -5,6 +5,7 @@
 #include <vector>
 
 #include <cuda_runtime.h>
+#include <nvtx3/nvToolsExt.h>  // NVTX：在 Nsight Systems 時間線上標出自訂區段
 
 #include "graph_io.h"
 
@@ -112,9 +113,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // NVTX 區段：nvtxRangePushA 開始、nvtxRangePop 結束，對應報告的 time distribution
     int V;
     std::vector<Edge> edges;
+    nvtxRangePushA("read input");
     read_graph(argv[1], V, edges);
+    nvtxRangePop();
 
     // 補齊到 BF 的倍數：虛擬點與真實點之間沒有邊，全部填 INF
     const int n = (V + BF - 1) / BF * BF;
@@ -122,11 +126,20 @@ int main(int argc, char** argv) {
     const size_t bytes = (size_t)n * n * sizeof(int);
 
     // host 端距離矩陣：n×n、每列長度 n
+    nvtxRangePushA("build matrix");
     std::vector<int> h_dist = make_dist_matrix(V, edges, n);
+    nvtxRangePop();
 
     int* d_dist = nullptr;
+    nvtxRangePushA("cudaMalloc + CUDA init");  // 第一個 CUDA API 呼叫會連帶做 context 初始化
     CUDA_CHECK(cudaMalloc(&d_dist, bytes));
+    nvtxRangePop();
+
+    nvtxRangePushA("H2D copy");
     CUDA_CHECK(cudaMemcpy(d_dist, h_dist.data(), bytes, cudaMemcpyHostToDevice));
+    nvtxRangePop();
+
+    nvtxRangePushA("compute");
 
     dim3 block(BF, BLOCK_Y);
     dim3 grid2(2*rounds-2), grid3(rounds-1, rounds-1);
@@ -141,9 +154,18 @@ int main(int argc, char** argv) {
     }
 
     CUDA_CHECK(cudaGetLastError());  // 檢查 kernel launch 是否失敗（例如 blockDim 超過上限）
+    // 量測用：launch 是非同步的，這裡等所有 kernel 跑完，"compute" 區段才會涵蓋實際計算時間；
+    // 少了這行，等待時間會被算進後面的 D2H cudaMemcpy
+    CUDA_CHECK(cudaDeviceSynchronize());
+    nvtxRangePop();
+
+    nvtxRangePushA("D2H copy");
     CUDA_CHECK(cudaMemcpy(h_dist.data(), d_dist, bytes, cudaMemcpyDeviceToHost));
+    nvtxRangePop();
     CUDA_CHECK(cudaFree(d_dist));
 
+    nvtxRangePushA("write output");
     write_dist(argv[2], h_dist.data(), V, n);  // 只寫出前 V 列、每列前 V 欄
+    nvtxRangePop();
     return 0;
 }
