@@ -97,13 +97,13 @@ __global__ void phase3(int* d, int n, int r) {
     int k_start = r * BF;
     int k_end = (r + 1) * BF;
 
-    for (int k = k_start; k < k_end; k++) {
-        int d_kx = d[k * n + x];
-        for (int y = y_start; y < y_end; y += BLOCK_Y) {
-            int * const d_y = d + y * n;
-            int &d_yx = d_y[x];
-            d_yx = min(d_yx, d_y[k] + d_kx);
+    for (int y = y_start; y < y_end; y += BLOCK_Y) {
+        int * const d_y = d + y * n;
+        int d_yx = d_y[x];
+        for (int k = k_start; k < k_end; k++) {
+            d_yx = min(d_yx, d_y[k] + d[k * n + x]);
         }
+        d_y[x] = d_yx;
     }
 }
 
