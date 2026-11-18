@@ -97,13 +97,28 @@ __global__ void phase3(int* d, int n, int r) {
     int k_start = r * BF;
     int k_end = (r + 1) * BF;
 
-    for (int y = y_start; y < y_end; y += BLOCK_Y) {
-        int * const d_y = d + y * n;
-        int d_yx = d_y[x];
-        for (int k = k_start; k < k_end; k++) {
-            d_yx = min(d_yx, d_y[k] + d[k * n + x]);
+    int d_yx[BF/BLOCK_Y];
+    int y;
+    
+    #pragma unroll
+    for (int i=0; i<BF/BLOCK_Y; i++) {
+        y = y_start + i * BLOCK_Y;
+        d_yx[i] = d[y * n + x];
+    }
+
+    for (int k = k_start; k < k_end; k++) {
+        int d_kx = d[k * n + x];
+        #pragma unroll
+        for (int i=0; i<BF/BLOCK_Y; i++) {
+            y = y_start + i * BLOCK_Y;
+            d_yx[i] = min(d_yx[i], d[y * n + k] + d_kx);
         }
-        d_y[x] = d_yx;
+    }
+
+    #pragma unroll
+    for (int i=0; i<BF/BLOCK_Y; i++) {
+        y = y_start + i * BLOCK_Y;
+        d[y * n + x] = d_yx[(y - y_start) / BLOCK_Y];
     }
 }
 
