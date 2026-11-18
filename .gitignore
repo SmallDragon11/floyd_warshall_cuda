@@ -12,6 +12,7 @@ build/
 
 # Nsight Compute 報告資料（體積大且每次重跑都會變；報告用數據改存截圖或匯出的 CSV）
 *.ncu-rep
+*.ncu-repz
 
 # 編輯器與暫存檔
 .vscode/
