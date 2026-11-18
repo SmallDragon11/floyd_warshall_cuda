@@ -92,17 +92,15 @@ __global__ void phase3(int* d, int n, int r) {
     
     int x = tileNoX * BF + threadIdx.x;
     int y_start = tileNoY * BF + threadIdx.y;
-    int y_end = (tileNoY + 1) * BF;
 
     int k_start = r * BF;
     int k_end = (r + 1) * BF;
 
     int d_yx[BF/BLOCK_Y];
-    int y;
     
     #pragma unroll
     for (int i=0; i<BF/BLOCK_Y; i++) {
-        y = y_start + i * BLOCK_Y;
+        int y = y_start + i * BLOCK_Y;
         d_yx[i] = d[y * n + x];
     }
 
@@ -110,15 +108,15 @@ __global__ void phase3(int* d, int n, int r) {
         int d_kx = d[k * n + x];
         #pragma unroll
         for (int i=0; i<BF/BLOCK_Y; i++) {
-            y = y_start + i * BLOCK_Y;
+            int y = y_start + i * BLOCK_Y;
             d_yx[i] = min(d_yx[i], d[y * n + k] + d_kx);
         }
     }
 
     #pragma unroll
     for (int i=0; i<BF/BLOCK_Y; i++) {
-        y = y_start + i * BLOCK_Y;
-        d[y * n + x] = d_yx[(y - y_start) / BLOCK_Y];
+        int y = y_start + i * BLOCK_Y;
+        d[y * n + x] = d_yx[i];
     }
 }
 
