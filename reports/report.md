@@ -30,7 +30,7 @@
 - 矩陣補齊到 BF 的倍數，補的值填 INF，kernel 不需邊界判斷。
 - 每輪在 default stream 依序 launch `phase1`（1 個 block）、`phase2`（`2*rounds-2` 個 block，前半 pivot row、後半 pivot column）、`phase3`（`(rounds-1)²` 個 block）。迴圈內沒有 host 同步。
 - 迴圈結束後的 `cudaDeviceSynchronize()` 只為了讓 NVTX `compute` 區段涵蓋實際的計算時間。
-- phase 3 的版本演進見第 6 節。
+- phase 3 的版本演進見第 5–7 節。
 
 ## 3. 量測方法
 
@@ -123,7 +123,7 @@ ncu --kernel-name phase3 --launch-skip 23 --launch-count 1 --set full --import-s
   | H2D copy | 63.140 ms | 51.787 ms |
   | D2H copy | 51.272 ms | 51.055 ms |
 
-  H2D 多出的 11.4 ms 全部在 GPU 開始搬資料之前（`cudaMemcpy` 開始 1874.273 ms，GPU memcpy 開始 1885.673 ms），來源是 pageable memory。成因是**待驗證假設**：page fault，或第一次 `cudaMemcpy` 的準備成本（見第 8 節）。
+  H2D 多出的 11.4 ms 全部在 GPU 開始搬資料之前（`cudaMemcpy` 開始 1874.273 ms，GPU memcpy 開始 1885.673 ms），來源是 pageable memory。成因是**待驗證假設**：page fault，或第一次 `cudaMemcpy` 的準備成本（見第 9 節）。
 - **c06 phase3（改前）**：`ncu` Duration 23.94 ms；Nsight Systems 47 次平均 23.29 ms（min 22.60、max 24.30）。
   - 【使用者】數字不一致，原因是 profiling overhead 不同。
   - 【待寫】具體原因：單次 vs 平均、`ncu` 鎖時脈、清 cache。可用 `--clock-control none --cache-control none` 驗證。
@@ -250,14 +250,60 @@ global load 減少的目的達成了，但每次更新累積值都要讀寫 loca
   - LSU 的工作量少了 1.87 倍，速度卻只快 1.69 倍，差額來自 LSU 利用率從 84.97% 降到 76.17%：1.87 × (76.17 / 84.97) ≈ 1.68，和實測的 1.69 吻合（推論）。
   - 【參考答案，待改寫】利用率下降的原因：每個 SM 同時駐留的 warp 從約 31 個降到約 24 個。warp 在等 load 回來時（L2 load hit rate 從 81.30% 降到 20.55%，等待時間較長），能補位發出 LSU 指令的 warp 變少，LSU 就有空檔。
   - 【使用者】驗證：Warp State Statistics 的 `Stall Long Scoreboard` 從 4.03 升到 7.55 cycles／指令（+87.20%），和上面的假設一致。
+  - 限制（推論）：stall 上升有兩個可能來源，這個量測分不開——warp 變少使延遲較難隱藏，以及 L2 hit rate 下降使每次 load 本身變慢。可用 `__launch_bounds__` 或 `-maxrregcount` 把 register 壓到 64 以下（回到 4 個 block）來分離，前提是陣列不被放進 local memory。
 
-## 7. 尚未完成
+## 7. 第三個優化：pivot tile 放進 shared memory（commit `9888208`）
 
-- shared memory 版本（方向 2：pivot tile 放進 shared memory），以及 bank conflict 分析。
+每個 block 先合作把 `d[y][k]`（程式中的 `pivotRow`）與 `d[k][x]`（`pivotCol`）兩個 64×64 tile 以合併存取載入 shared memory，`__syncthreads()` 一次後，k 迴圈改從 shared memory 讀取。tile 在 k 迴圈中只讀不寫，所以不需要第二個 barrier。
+
+- ptxas：77 registers，**32768 bytes smem**，0 bytes stack frame。
+- c01–c06 正確。
+- 報告：`reports\c06_phase3_smem.ncu-repz`（同樣是 c06 第 24 輪 phase3，從 ASCII 路徑編譯）。
+
+### 7.1 預測與實測
+
+| 指標 | register 重用 | 預測 | shared memory |
+|---|---:|---|---:|
+| Duration | 2.00 ms | — | **989.86 µs（2.02×）** |
+| global load requests | 18,688,512（每個 warp 1104） | 每個 warp 48 | 812,544（每個 warp **48**） |
+| Block Limit Registers／Shared Mem | 3／— | ?／2 | 3／**2** |
+| 理論／Achieved Occupancy | 75%／74.06% | 50%／≈ 50% | 50%／48.72% |
+| Stall Long Scoreboard（cycles／指令） | 7.55 | 大幅下降 | 0.61（−91.86%） |
+| Stall Short Scoreboard（cycles／指令） | 0.03 | 上升 | 0.97 |
+| SOL Memory／Compute | 76.17%／76.17% | — | 92.57%／92.57% |
+| Breakdown 第一列 | `Pipe Lsu` | — | `Pipe Lsu`（92.57%，+21.52%） |
+| k 迴圈的 shared load 指令（每個 warp） | — | 1088 | **576** |
+| shared load bank conflicts | — | 0 | 52,106（逐條指令：0） |
+
+數據來源：Duration、SOL 取自 GPU Speed Of Light；global load requests 取自 Raw 頁 `l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum`；occupancy 取自 Occupancy section；stall 取自 Warp State Statistics；shared load 指令數與逐條 wavefront 取自 Source 頁（`ncu --page source --print-source sass --csv` 匯出）；bank conflicts 取自 Memory Tables → Shared Memory。
+
+### 7.2 分析
+
+- 【使用者】預測的計算：每個 warp 的 global load 為 `d[y][x]` 16 + `d[y][k]` tile（64×64 / 32 / 8 = 16）+ `d[k][x]` tile 16 = 48 條，實測相符。一個 block 用 2 × 64 × 64 × 4 B = 32 KB shared memory，sm_75 每個 SM 最多 64 KB（CUDA Programming Guide 的 compute capability 表），所以每個 SM 只放得下 2 個 block，理論 occupancy 2 × 8 / 32 = 50%，實測 48.72%。
+- 【使用者】shared memory 也走 LSU（Nsight Compute Profiling Guide：「The LSU pipeline issues load, store, atomic, and reduction instructions to the L1TEX unit for global, local, and shared memory」），所以 k 迴圈的 load 指令數不會因為改用 shared memory 而減少，改善來自等待時間。
+- 【使用者】瓶頸仍是 LSU，利用率從 76.17% 升到 92.57%。
+- 【參考答案，待改寫】為什麼 occupancy 降到 50% 仍快 2.02×：
+  - 等待從 L1TEX（global）換成 MIO（shared）。Profiling Guide 定義 Long Scoreboard 為等待 L1TEX（local、global、surface、texture）、Short Scoreboard 主要為等待 shared memory。每條指令的 Long Scoreboard 減少 6.94 cycles，Short Scoreboard 只增加 0.94 cycles。
+  - 等待變短，較少的 warp 也足以讓 LSU 保持忙碌，所以 LSU 利用率反而上升到 92.57%。
+- 【參考答案，待改寫】編譯器的自動向量化（Source 頁）：
+  - 有被執行的 shared load 為 4 條 `LDS.U` 與 32 條 `LDS.U.64`，每條 `Instructions Executed` = 270,848 = 16,928 warps × 16，表示 k 迴圈被展開成每次 4 個 k。
+  - `pivotRow[offset][k]` 與 `[k+1]` 相鄰，被合併成一條 64 bit 讀取；`pivotCol[k][threadIdx.x]` 不同 k 相隔一整列，每個 k 一條。
+  - 每個 warp 共 (4 + 32) × 16 = 576 條，而不是預測的 1088 條。另有 35 條 `LDS` 的執行次數為 0（推論：處理剩餘迴圈次數的路徑，未驗證）。
+- 【參考答案，待改寫】bank conflict：
+  - 52,106 只佔 shared load wavefronts（9,801,470）的 0.53%【使用者】。
+  - Source 頁逐條指令的 `L1 Wavefronts Shared` = `Ideal` = 9,750,528，`Excessive` = 0，所以存取模式本身沒有 bank conflict：`pivotCol` 為同一列連續 32 個 int，`pivotRow` 為 broadcast。
+  - 總計數器多出的 50,942 個 wavefront 與 bank conflict 計數相近。重跑 3 次得 52,664／50,876／50,365（store：14,432／14,321／14,594），每次不同，而固定的存取模式應產生固定的 conflict 數，所以推論來自執行時的競爭。
+  - 【待驗證假設】Turing 的 L1 與 shared memory 共用 data bank，搬 tile 的 global load 可能和 shared memory 存取競爭。未在文件中查到該計數器包含此類競爭。
+  - 結論：判斷 bank conflict 以 Source 頁逐條指令的 `Excessive` 為準。
+- 【待寫】下一步的方向：LSU 已接近滿載，要再變快必須減少 LSU 指令數（例如更寬的 shared load，或讓一個 thread 負責多個 x 以重用 `pivotCol` 的讀取）。
+
+## 8. 尚未完成
+
+- 減少 LSU 指令數的下一版 phase3。
 - blocking factor 實驗（BF = 32／64／128）：Integer GOPS、device／shared memory 頻寬。
 - 多 GPU／多節點版的概念討論（未實作、未實測）。
 
-## 8. 待驗證問題
+## 9. 待驗證問題
 
 - H2D 投影比 CPU 端區段短 11.4 ms 的原因（page fault，或第一次 `cudaMemcpy` 的準備成本）。驗證方式：連做兩次 H2D，或改用 `cudaMallocHost`。
 - `ncu` 和 Nsight Systems 的 Duration 差異來源（見 4.5）。
