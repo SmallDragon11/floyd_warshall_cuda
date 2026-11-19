@@ -226,14 +226,30 @@ global load 減少的目的達成了，但每次更新累積值都要讀寫 loca
 
 | 指標 | y 在外 | register 重用 |
 |---|---:|---:|
-| Duration | 3.38 ms | 【待使用者讀取】 |
-| global load requests（每個 warp） | 2064 | 【待使用者讀取】（預測 1104） |
-| local load requests | 0 | 【待使用者讀取】（預測 0） |
-| Block Limit Registers／Achieved Occupancy | — | 【待使用者讀取】 |
-| SOL Memory／Compute、Breakdown 第一列 | 84.97%／84.97%，LSU | 【待使用者讀取】 |
-| 總指令數 | 109,405,664 | 【待使用者讀取】 |
+| Duration | 3.38 ms | **2.00 ms**（1.69×） |
+| global load requests | 34,939,392（每個 warp 2064） | 18,688,512（每個 warp **1104**，符合預測） |
+| local load requests | 0 | 0（符合預測） |
+| Block Limit Registers | 4 | 3 |
+| 理論／Achieved Occupancy | 100%／98.23% | 75%／74.06% |
+| Stall Long Scoreboard（cycles／指令） | 4.03 | 7.55（+87.20%） |
+| SOL Memory／Compute | 84.97%／84.97% | 76.17%／76.17% |
+| Breakdown 第一列 | `Pipe Lsu`／`Lsuin Requests` | `Pipe Lsu`／`Lsuin Requests`（不變） |
+| 總指令數（Executed） | 109,405,664 | 80,391,072（−26.52%） |
 
-**分析**：【待寫】speedup、occupancy 的代價（72 registers × 256 threads → 每個 SM 幾個 block）、瓶頸是否仍在 LSU。
+數據來源：Duration 取自 GPU Speed Of Light；global／local load requests 取自 Raw 頁的 `l1tex__t_requests_pipe_lsu_mem_{global,local}_op_ld.sum`；occupancy 取自 Occupancy section；指令數取自 Instruction Statistics。
+
+**分析**：
+
+- 【使用者】speedup 1.69×。每個 warp 的 global load requests 從 2064 降到 1104，local load 為 0，表示累積值確實留在 register。
+- 【使用者】一個 thread 72 registers × 256 threads/block = 18,432 registers/block。sm_75 每個 SM 有 64 K registers（CUDA Programming Guide 的 compute capability 表），65,536 / 18,432 = 3.56，所以每個 SM 只放得下 3 個 block，和 `Block Limit Registers` = 3 一致。
+- 【參考答案，待改寫】occupancy 的代價：
+  - 理論 occupancy = 3 blocks × 8 warps / 32 warps（sm_75 每個 SM 最多 32 個 warp）= 75%。Achieved 74.06% 幾乎等於理論值，表示限制來自 register，而不是排程。
+  - occupancy 從 98% 降到 74%，速度卻快了 1.69×：occupancy 只是隱藏延遲的手段，本身不是目標。這一版用較少的 warp 換到較少的 LSU 指令，換算下來是值得的。
+- 【參考答案，待改寫】瓶頸仍在 LSU，以及百分比為何下降：
+  - 總指令數只少了 26.52%（0.735 倍），時間卻是原來的 0.59 倍，所以不能只看總指令數。瓶頸在 LSU，該看經過 LSU 的工作量：每個 warp 的 global load requests 是 2064 / 1104 = 1.87 倍。
+  - LSU 的工作量少了 1.87 倍，速度卻只快 1.69 倍，差額來自 LSU 利用率從 84.97% 降到 76.17%：1.87 × (76.17 / 84.97) ≈ 1.68，和實測的 1.69 吻合（推論）。
+  - 【參考答案，待改寫】利用率下降的原因：每個 SM 同時駐留的 warp 從約 31 個降到約 24 個。warp 在等 load 回來時（L2 load hit rate 從 81.30% 降到 20.55%，等待時間較長），能補位發出 LSU 指令的 warp 變少，LSU 就有空檔。
+  - 【使用者】驗證：Warp State Statistics 的 `Stall Long Scoreboard` 從 4.03 升到 7.55 cycles／指令（+87.20%），和上面的假設一致。
 
 ## 7. 尚未完成
 
