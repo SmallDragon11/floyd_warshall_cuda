@@ -254,7 +254,7 @@ global load 減少的目的達成了，但每次更新累積值都要讀寫 loca
 
 ## 7. 第三個優化：pivot tile 放進 shared memory（commit `9888208`）
 
-每個 block 先合作把 `d[y][k]`（程式中的 `pivotRow`）與 `d[k][x]`（`pivotCol`）兩個 64×64 tile 以合併存取載入 shared memory，`__syncthreads()` 一次後，k 迴圈改從 shared memory 讀取。tile 在 k 迴圈中只讀不寫，所以不需要第二個 barrier。
+每個 block 先合作把 `d[y][k]`（程式中的 `pivotCol`）與 `d[k][x]`（`pivotRow`）兩個 64×64 tile 以合併存取載入 shared memory，`__syncthreads()` 一次後，k 迴圈改從 shared memory 讀取。tile 在 k 迴圈中只讀不寫，所以不需要第二個 barrier。
 
 - ptxas：77 registers，**32768 bytes smem**，0 bytes stack frame。
 - c01–c06 正確。
@@ -287,15 +287,15 @@ global load 減少的目的達成了，但每次更新累積值都要讀寫 loca
   - 等待變短，較少的 warp 也足以讓 LSU 保持忙碌，所以 LSU 利用率反而上升到 92.57%。
 - 【參考答案，待改寫】編譯器的自動向量化（Source 頁）：
   - 有被執行的 shared load 為 4 條 `LDS.U` 與 32 條 `LDS.U.64`，每條 `Instructions Executed` = 270,848 = 16,928 warps × 16，表示 k 迴圈被展開成每次 4 個 k。
-  - `pivotRow[offset][k]` 與 `[k+1]` 相鄰，被合併成一條 64 bit 讀取；`pivotCol[k][threadIdx.x]` 不同 k 相隔一整列，每個 k 一條。
+  - `pivotCol[offset][k]` 與 `[k+1]` 相鄰，被合併成一條 64 bit 讀取；`pivotRow[k][threadIdx.x]` 不同 k 相隔一整列，每個 k 一條。
   - 每個 warp 共 (4 + 32) × 16 = 576 條，而不是預測的 1088 條。另有 35 條 `LDS` 的執行次數為 0（推論：處理剩餘迴圈次數的路徑，未驗證）。
 - 【參考答案，待改寫】bank conflict：
   - 52,106 只佔 shared load wavefronts（9,801,470）的 0.53%【使用者】。
-  - Source 頁逐條指令的 `L1 Wavefronts Shared` = `Ideal` = 9,750,528，`Excessive` = 0，所以存取模式本身沒有 bank conflict：`pivotCol` 為同一列連續 32 個 int，`pivotRow` 為 broadcast。
+  - Source 頁逐條指令的 `L1 Wavefronts Shared` = `Ideal` = 9,750,528，`Excessive` = 0，所以存取模式本身沒有 bank conflict：`pivotRow` 為同一列連續 32 個 int，`pivotCol` 為 broadcast。
   - 總計數器多出的 50,942 個 wavefront 與 bank conflict 計數相近。重跑 3 次得 52,664／50,876／50,365（store：14,432／14,321／14,594），每次不同，而固定的存取模式應產生固定的 conflict 數，所以推論來自執行時的競爭。
   - 【待驗證假設】Turing 的 L1 與 shared memory 共用 data bank，搬 tile 的 global load 可能和 shared memory 存取競爭。未在文件中查到該計數器包含此類競爭。
   - 結論：判斷 bank conflict 以 Source 頁逐條指令的 `Excessive` 為準。
-- 【待寫】下一步的方向：LSU 已接近滿載，要再變快必須減少 LSU 指令數（例如更寬的 shared load，或讓一個 thread 負責多個 x 以重用 `pivotCol` 的讀取）。
+- 【待寫】下一步的方向：LSU 已接近滿載，要再變快必須減少 LSU 指令數（例如更寬的 shared load，或讓一個 thread 負責多個 x 以重用 `pivotRow` 的讀取）。
 
 ## 8. 尚未完成
 
