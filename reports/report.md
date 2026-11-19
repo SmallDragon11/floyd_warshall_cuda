@@ -299,7 +299,7 @@ global load 減少的目的達成了，但每次更新累積值都要讀寫 loca
 
 ## 8. 尚未完成
 
-- 減少 LSU 指令數的下一版 phase3。
+- 減少 LSU 指令數的下一版 phase3：`pivotCol` 改用 `int4`（128 bit）讀取，預測每個 warp 的 shared load 從 576 條降到 320 條（`pivotRow` 64 + `pivotCol` 16 × 64 / 4 = 256）。
 - blocking factor 實驗（BF = 32／64／128）：Integer GOPS、device／shared memory 頻寬。
 - 多 GPU／多節點版的概念討論（未實作、未實測）。
 
@@ -307,3 +307,6 @@ global load 減少的目的達成了，但每次更新累積值都要讀寫 loca
 
 - H2D 投影比 CPU 端區段短 11.4 ms 的原因（page fault，或第一次 `cudaMemcpy` 的準備成本）。驗證方式：連做兩次 H2D，或改用 `cudaMallocHost`。
 - `ncu` 和 Nsight Systems 的 Duration 差異來源（見 4.5）。
+- register 重用版 `Stall Long Scoreboard` 上升的兩個來源（occupancy 下降 vs L2 hit rate 下降）如何分離（見 6.2）。
+- shared memory 版 bank conflict 總計數器每次執行不同的原因（見 7.2）。
+- 編譯器只把 `pivotCol` 的讀取合併成 `LDS.U.64` 而非 `LDS.U.128` 的原因：推測無法證明 16 bytes 對齊。驗證：明確以 `int4` 讀取後看 SASS。
