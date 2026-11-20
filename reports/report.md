@@ -123,7 +123,7 @@ ncu --kernel-name phase3 --launch-skip 23 --launch-count 1 --set full --import-s
   | H2D copy | 63.140 ms | 51.787 ms |
   | D2H copy | 51.272 ms | 51.055 ms |
 
-  H2D 多出的 11.4 ms 全部在 GPU 開始搬資料之前（`cudaMemcpy` 開始 1874.273 ms，GPU memcpy 開始 1885.673 ms），來源是 pageable memory。成因是**待驗證假設**：page fault，或第一次 `cudaMemcpy` 的準備成本（見第 9 節）。
+  H2D 多出的 11.4 ms 全部在 GPU 開始搬資料之前（`cudaMemcpy` 開始 1874.273 ms，GPU memcpy 開始 1885.673 ms），來源是 pageable memory。成因是**待驗證假設**：page fault，或第一次 `cudaMemcpy` 的準備成本（見第 10 節）。
 - **c06 phase3（改前）**：`ncu` Duration 23.94 ms；Nsight Systems 47 次平均 23.29 ms（min 22.60、max 24.30）。
   - 【使用者】數字不一致，原因是 profiling overhead 不同。
   - 【待寫】具體原因：單次 vs 平均、`ncu` 鎖時脈、清 cache。可用 `--clock-control none --cache-control none` 驗證。
@@ -297,16 +297,95 @@ global load 減少的目的達成了，但每次更新累積值都要讀寫 loca
   - 結論：判斷 bank conflict 以 Source 頁逐條指令的 `Excessive` 為準。
 - 【待寫】下一步的方向：LSU 已接近滿載，要再變快必須減少 LSU 指令數（例如更寬的 shared load，或讓一個 thread 負責多個 x 以重用 `pivotRow` 的讀取）。
 
-## 8. 尚未完成
+## 8. 第四個嘗試：`pivotCol` 改用 `int4` 讀取（commit `5d56c03`）
 
-- 減少 LSU 指令數的下一版 phase3：`pivotCol` 改用 `int4`（128 bit）讀取，預測每個 warp 的 shared load 從 576 條降到 320 條（`pivotRow` 64 + `pivotCol` 16 × 64 / 4 = 256）。
+`pivotCol` 宣告加上 `__align__(16)`；k 迴圈每次前進 4，以 `*reinterpret_cast<const int4*>(&pivotCol[offset][k_shared])` 一次讀 4 個值，再依序用 `.x .y .z .w` 更新 `d_yx`；`pivotRow` 照舊每個 k 一條。
+
+- ptxas：**80 registers**（shared memory 版 77），32768 bytes smem，0 bytes stack frame。
+- c01–c06 正確；`compute-sanitizer --tool memcheck`（c03）0 errors，128 bit 讀取沒有對齊錯誤。
+- 報告：`reports\c06_phase3_int4.ncu-repz`（c06 第 24 輪 phase3，從 ASCII 路徑編譯），baseline 為 `c06_phase3_smem`。
+
+### 8.1 先做的對照實驗：只加 `__align__(16)`
+
+k 迴圈不改、只在 `pivotCol` 加 `__align__(16)`，`cuobjdump -sass` 的 phase3 靜態指令與 shared memory 版完全相同：
+
+| 版本 | `LDS.U` | `LDS.U.64` | `LDS.U.128` |
+|---|---:|---:|---:|
+| shared memory 版 | 23 | 48 | 0 |
+| 只加 `__align__(16)` | 23 | 48 | 0 |
+| int4 版 | 4 | 0 | 16 |
+
+7.2 的推測「編譯器無法證明 16 bytes 對齊，所以只合併成 64 bit」不成立：對齊確定後編譯器仍只用 `LDS.U.64`，原因未查明。要拿到 128 bit 讀取必須在程式中明確寫出。
+
+### 8.2 預測與實測
+
+| 指標 | shared memory | 預測 | int4 |
+|---|---:|---|---:|
+| Duration | 989.86 µs | 509–550 µs | **964.51 µs（1.03×）** |
+| shared load 指令（每個 warp） | 576 | 320 | **320**（`LDS.U` 64 + `LDS.U.128` 256） |
+| 每條指令的 shared wavefront | `LDS.U` 1、`LDS.U.64` 1 | `LDS.U.128`：1 或 4 | `LDS.U` 1、**`LDS.U.128` 2** |
+| shared load wavefront（每個 warp） | 576 | — | **576** |
+| shared load wavefront 總數（Raw） | 9,801,470 | — | 9,790,266 |
+| `L1 Wavefronts Shared Excessive`（逐條） | 0 | — | 0 |
+| SOL Memory／Compute | 92.57%／92.57% | — | 84.84%／58.62% |
+| `Pipe Lsu`（`sm__inst_executed_pipe_lsu`） | 92.71% | — | 58.98% |
+| L1: Lsuin Requests | 92.57% | — | 58.62% |
+| L1/TEX Cache Throughput | 93.17% | — | 95.34% |
+| L1: Data Pipe Lsu Wavefronts | 46.59% | — | 47.67% |
+| DRAM: Cycles Active | 82.93% | — | 84.84% |
+| DRAM 讀／寫 | 70.10 MB／34.61 MB | — | 70.09 MB／34.63 MB |
+| Block Limit Registers／Shared Mem | 3／2 | 3／2 | 3／2 |
+| Achieved Occupancy | 48.72% | — | 48.78% |
+| Executed Instructions | 48,854,208 | — | 44,419,072（−9%） |
+| Stall Long Scoreboard（cycles／指令） | 0.61 | — | 1.53（+148.59%） |
+| Stall Short Scoreboard（cycles／指令） | 0.97 | — | 1.02 |
+
+數據來源：Duration、SOL、Breakdown 取自 GPU Speed Of Light（`--page details --section SpeedOfLight --print-details all`）；指令與逐條 wavefront 取自 Source 頁 CSV（每條 `LDS` 的 `Instructions Executed` 皆為 270,848 = 16,928 warps × 16）；wavefront 總數、DRAM 位元組、Executed Instructions 取自 Raw 頁（`l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum`、`dram__bytes_{read,write}.sum`、`smsp__inst_executed.sum`）；occupancy 取自 Occupancy section；stall 取自 Warp State Statistics。
+
+PC sampling 的 stall 樣本數（Raw 頁 `smsp__pcsamp_warps_issue_stalled_*`，只列變化較大的項目）：
+
+| stall | shared memory | int4 | 變化 |
+|---|---:|---:|---:|
+| 總樣本數 | 18,029 | 17,548 | −481 |
+| MIO Throttle | 7,045 | 4,976 | −2,069 |
+| Long Scoreboard | 1,291 | 3,335 | +2,044 |
+| Not Selected | 2,010 | 1,349 | −661 |
+
+Long Scoreboard 樣本在 Source 頁的位置（Profiling Guide：樣本記在等待結果的 consumer 指令上）：
+
+| 指令 | shared memory | int4 |
+|---|---:|---:|
+| k 迴圈中第一次使用 `d_yx` 的 `IMNMX` | 741 | 1,574 |
+| 載入 tile 時寫 shared memory 的 `STS` | 414 + 118 | 1,563 + 159 |
+
+### 8.3 分析
+
+- 【使用者】預測：LSU 利用率 92.57%，若時間由 LSU 指令數決定，利用率維持不變時為 989.86 × 320 / 576 ≈ 550 µs；利用率拉到 100% 的下限為 989.86 × 0.9257 × 320 / 576 ≈ 509 µs。
+- 【使用者】occupancy：shared memory 仍是 32 KB，每個 SM 只放得下 2 個 block；register 增為 80 後 65536 / (80 × 256) = 3.2，仍可放 3 個 block，所以 occupancy 不受影響。
+- 【使用者】wavefront：`LDS.U.128` 每條 `Instructions Executed` 270,848 = 16,928 warps × 16，`L1 Wavefronts Shared` = `Ideal` = 541,696，每條 2 個 wavefront、沒有 bank conflict。原本的兩個假設（只看需要的位元組數 → 1 個；固定以 1/4 warp 為單位 → 4 個）都不成立。
+- 【使用者】每個 warp 的 shared load wavefront：shared memory 版 64 + 512 × 1 = 576，int4 版 64 + 256 × 2 = 576；576 × 16,928 = 9,750,528，與 Raw 頁的 9,801,470、9,790,266 相近。
+- 【參考答案，待改寫】為什麼幾乎沒變快：
+  - shared memory 版受限的不是 LSU 指令數，而是處理 shared memory wavefront 的吞吐量。一個 wavefront 在 L1TEX 的處理階段佔一個 cycle（Profiling Guide 2.3.7），而每個 warp 的 wavefront 數兩版都是 576。
+  - 指令數減少只降低了指令發出端的負擔：`Pipe Lsu`、Lsuin Requests 從 92% 降到 59%，Duration 只少 2.6%。
+  - 預測失準的原因：假設「時間正比於 LSU 指令數」，但與時間成正比的應是 wavefront 數（推論，前提為 wavefront 吞吐量是瓶頸；驗證方式見下一版）。
+- 【參考答案，待改寫】為什麼 Long Scoreboard 增加：
+  - 指令只少 9%，Long Scoreboard 樣本卻多了 2,044 個，所以不是平均值的分母變小，而是等待 global load 的時間真的變長。
+  - MIO Throttle 減少的樣本數（−2,069）與 Long Scoreboard 增加的（+2,044）幾乎相同。Profiling Guide 定義 MIO Throttle 為等待 MIO 指令佇列不再滿，shared memory 指令是其中之一。
+  - 推論：shared memory 指令變少，warp 塞在 MIO 佇列的時間變短，較早走到 global load 的使用端（`STS`、第一次用 `d_yx` 的 `IMNMX`，兩者的 Long Scoreboard 樣本都約增為 2 倍），但 DRAM 讀取量相同、忙碌程度本來就高（82.93% → 84.84%），所以改成等資料回來。瓶頸沒變，總時間也就幾乎不變。
+- 【待寫】下一步的方向：要減少的是 wavefront 數，而不是指令數；同時 DRAM 已接近 85%，可能成為下一個上限。
+
+## 9. 尚未完成
+
+- 減少 shared memory wavefront 的下一版 phase3：讓一個 thread 負責多個 x，同一次 `pivotCol` 讀取供多個 x 使用。驗證：每個 warp 的 shared load wavefront 數與 Duration 是否同比例下降。
 - blocking factor 實驗（BF = 32／64／128）：Integer GOPS、device／shared memory 頻寬。
 - 多 GPU／多節點版的概念討論（未實作、未實測）。
 
-## 9. 待驗證問題
+## 10. 待驗證問題
 
 - H2D 投影比 CPU 端區段短 11.4 ms 的原因（page fault，或第一次 `cudaMemcpy` 的準備成本）。驗證方式：連做兩次 H2D，或改用 `cudaMallocHost`。
 - `ncu` 和 Nsight Systems 的 Duration 差異來源（見 4.5）。
 - register 重用版 `Stall Long Scoreboard` 上升的兩個來源（occupancy 下降 vs L2 hit rate 下降）如何分離（見 6.2）。
 - shared memory 版 bank conflict 總計數器每次執行不同的原因（見 7.2）。
-- 編譯器只把 `pivotCol` 的讀取合併成 `LDS.U.64` 而非 `LDS.U.128` 的原因：推測無法證明 16 bytes 對齊。驗證：明確以 `int4` 讀取後看 SASS。
+- 編譯器只把 `pivotCol` 的讀取合併成 `LDS.U.64` 而非 `LDS.U.128` 的原因：「無法證明 16 bytes 對齊」已被 8.1 推翻，實際原因未查明。
+- broadcast 的 `LDS.U.128` 為什麼需要 2 個 wavefront（`LDS.U.64` 只要 1 個）：Profiling Guide 沒有說明 shared memory 各存取寬度的 wavefront 規則。
+- L1/TEX Cache Throughput 恰為 L1: Data Pipe Lsu Wavefronts 的 2 倍（93.17 = 2 × 46.59、95.34 = 2 × 47.67），且大於 Breakdown 中列出的每一項（int4 版最大為 Lsuin Requests 58.62%）。Profiling Guide 說 throughput 取組成計數器的最大值，但沒有這兩個 metric 的定義。推論：throughput 用的組成項與 breakdown 顯示的峰值不同，95.34% 反映的是 wavefront 吞吐量；未驗證。這也是 8.3「wavefront 吞吐量是瓶頸」的前提，驗證方式是下一版減少 wavefront 數後看 Duration 是否同比例下降。
