@@ -371,14 +371,50 @@ Long Scoreboard 樣本在 Source 頁的位置（Profiling Guide：樣本記在�
 - 【參考答案，待改寫】為什麼 Long Scoreboard 增加：
   - 指令只少 9%，Long Scoreboard 樣本卻多了 2,044 個，所以不是平均值的分母變小，而是等待 global load 的時間真的變長。
   - MIO Throttle 減少的樣本數（−2,069）與 Long Scoreboard 增加的（+2,044）幾乎相同。Profiling Guide 定義 MIO Throttle 為等待 MIO 指令佇列不再滿，shared memory 指令是其中之一。
-  - 推論：shared memory 指令變少，warp 塞在 MIO 佇列的時間變短，較早走到 global load 的使用端（`STS`、第一次用 `d_yx` 的 `IMNMX`，兩者的 Long Scoreboard 樣本都約增為 2 倍），但 DRAM 讀取量相同、忙碌程度本來就高（82.93% → 84.84%），所以改成等資料回來。瓶頸沒變，總時間也就幾乎不變。
+  - Long Scoreboard 樣本落在 global load 的使用端：載入 tile 時的 `STS`、讀完初始 `d_yx` 後第一次使用它的 `IMNMX`，兩者都約增為 2 倍。global store 不需等待結果，不會出現在此（推論）。
+  - 量測事實只支持「等待原因從 MIO Throttle 轉成 Long Scoreboard，總時間與 DRAM 讀寫量幾乎不變」。為什麼 tile 與 `d_yx` 的 global load 要等更久，確切機制未查明【待驗證假設】：每個 SM 同時有 2 個 block，一個在跑 k 迴圈時另一個可能在載入 tile，兩者共用 L1TEX，可能互相競爭；DRAM 本來就忙（82.93% → 84.84%）。
 - 【待寫】下一步的方向：要減少的是 wavefront 數，而不是指令數；同時 DRAM 已接近 85%，可能成為下一個上限。
 
 ## 9. 尚未完成
 
-- 減少 shared memory wavefront 的下一版 phase3：讓一個 thread 負責多個 x，同一次 `pivotCol` 讀取供多個 x 使用。驗證：每個 warp 的 shared load wavefront 數與 Duration 是否同比例下降。
+- 減少 shared memory wavefront 的下一版 phase3：讓一個 thread 負責 2 個 x，同一次 `pivotCol` 讀取供 2 個 x 使用（預測與設計見 9.1）。
 - blocking factor 實驗（BF = 32／64／128）：Integer GOPS、device／shared memory 頻寬。
 - 多 GPU／多節點版的概念討論（未實作、未實測）。
+
+### 9.1 下一版（一個 thread 負責 2 個 x）的預測
+
+原理：`pivotCol[y][k]` 對同一列 y 的所有 x 都相同，且為 broadcast 讀取，一個 wavefront 服務整個 warp 涵蓋的 x。現在一個 warp 只涵蓋 32 個 x，同一列 y 的 `pivotCol` 由兩個 warp 各讀一次；一個 thread 負責 2 個 x 後，一個 warp 涵蓋整個 tile 寬度（64），每列只讀一次。`pivotRow[k][x]` 每個 x 都不同，總量省不了。
+
+- 【使用者】2 個 x 取 x 與 x+32：一條 `LDS` 讀同一列連續 32 個 int，落在 32 個不同 bank，1 個 wavefront。寫回 global memory 也維持合併存取（推論）。
+- 【使用者】兩種 block 形狀的比較（`pivotRow` 與 occupancy 兩格經 agent 提示後更正）：
+
+| | 現在（64 × 4） | 32 × 4 | 32 × 8 |
+|---|---:|---:|---:|
+| 每個 block 的 warp 數 | 8 | 4 | 8 |
+| 每個 thread 負責 | 16 y、1 x | 16 y、2 x | 8 y、2 x |
+| 累積值（`d_yx`）個數 | 16 | 32 | 16 |
+| block 的 `pivotCol` wavefront | 16 × 16 × 2 × 8 = 4096 | 16 × 16 × 2 × 4 = 2048 | 8 × 16 × 2 × 8 = 2048 |
+| block 的 `pivotRow` wavefront | 64 × 8 = 512 | 64 × 2 × 4 = 512 | 64 × 2 × 8 = 1024 |
+| block 的 shared load wavefront 合計 | 4608 | 2560（−44%） | 3072（−33%） |
+| 每個 SM 的 block 數（shared memory 限制） | 2 | 2 | 2 |
+| 理論 occupancy | 16 / 32 = 50% | 8 / 32 = 25% | 16 / 32 = 50% |
+
+- 【使用者】先做 32 × 8：thread 數與累積值個數都和現在相同，只改變 wavefront 數，較容易判斷因果；32 × 4 同時改變 occupancy 與 register 兩個因素。
+- 【使用者】兩個上限（推論，前提：Duration 與 wavefront 數成正比；`DRAM: Cycles Active` 近似 DRAM 頻寬利用率；DRAM 讀寫量不變）：
+  - shared memory wavefront：964.51 × 3072 / 4608 ≈ **643 µs**。
+  - DRAM 忙到 100%：964.51 × 0.8484 ≈ **818 µs**。
+  - Duration 由較慢者決定，所以預測約 818 µs 以上（約 1.18×）。做完後 phase3 的瓶頸可能轉為 DRAM，要再變快須減少 DRAM 流量（見 9.2）。
+- 實作注意：phase1、phase2、phase3 目前共用 `BLOCK_Y`（`src/apsp.cu:29`）與 `dim3 block(BF, BLOCK_Y)`（`src/apsp.cu:186`）。phase1、phase2 維持 64 × 4，phase3 需要自己的 block 形狀常數與 `dim3`；載入 tile 的迴圈也要依新的 thread 排列修改。
+- 量測時要對照：Duration（≥ 818 µs）、每個 block 的 shared wavefront（4608 → 3072）、`DRAM: Cycles Active`（接近 100%）、`dram__throughput`、ptxas register 數（預期與現在相近）。報告存為 `reports\c06_phase3_x2.ncu-repz`。
+
+### 9.2 DRAM 流量與 BF 的關係
+
+- 每個 block 把 `d[y][x]` 從 DRAM 讀進 register 一次、寫回一次，中間在 k 迴圈中用了 BF 次；pivot tile 的每個值也被用 BF 次。每輪整個矩陣進出 DRAM 一次，共 n / BF 輪，所以 DRAM 總流量約與 n² × (n / BF) 成正比，總計算量 n³ 與 BF 無關（推論）。
+- c06 的量測對照（int4 版）：
+  - 【使用者】矩陣 3008 × 3008 × 4 B ≈ 36.19 MB；DRAM 讀取 70.09 MB 約為其 2 倍。
+  - phase3 的 grid 為 46 × 46（第 r 個 block 列與行由 phase1、phase2 負責），46 × 46 × 64 × 64 × 4 B ≈ 34.67 MB，與 DRAM 寫入 34.63 MB 相符。
+  - 讀取中約 34.7 MB 為 `d[y][x]`，其餘約 35 MB 為 pivot tile。若兩個 pivot tile 全部打到 DRAM，讀取應約為 3 倍（約 104 MB），所以約一半的 pivot 讀取在 L2 命中（推論）。哪個 tile 命中【待驗證假設】：看 Memory Workload Analysis 的 L2 hit rate，或 Source 頁逐條 `LDG` 的 L2 sectors。
+- 限制：兩個 tile 的 shared memory 用量為 2 × BF² × 4 B，BF = 128 時 128 KB 超過 sm_75 每個 SM 的 64 KB；BF 越大，phase1 只有一個 block 的序列部分越長（推論，blocking factor 實驗時以 nsys 看各 phase 時間比例驗證）。
 
 ## 10. 待驗證問題
 
