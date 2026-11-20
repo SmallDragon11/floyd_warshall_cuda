@@ -98,7 +98,8 @@ __global__ void phase3(int* d, int n, int r) {
 
     int d_yx[BF/BLOCK_Y];
 
-    __shared__ int pivotCol[BF][BF], pivotRow[BF][BF];
+    __shared__ int pivotRow[BF][BF];
+    __shared__ __align__(16) int pivotCol[BF][BF];
 
     // d[y][k] tile, aka pivotCol
     for (int i=0; i<BF/BLOCK_Y; i++) {
@@ -124,14 +125,20 @@ __global__ void phase3(int* d, int n, int r) {
         d_yx[i] = d[y * n + x];
     }
 
-    for (int k = k_start; k < k_end; k++) {
+    for (int k = k_start; k < k_end; k+=4) {
         int k_shared = k - k_start;
-        int d_kx = pivotRow[k_shared][threadIdx.x];
+        int d_kx0 = pivotRow[k_shared][threadIdx.x];
+        int d_kx1 = pivotRow[k_shared + 1][threadIdx.x];
+        int d_kx2 = pivotRow[k_shared + 2][threadIdx.x];
+        int d_kx3 = pivotRow[k_shared + 3][threadIdx.x];
         #pragma unroll
         for (int i=0; i<BF/BLOCK_Y; i++) {
             int offset = threadIdx.y + i * BLOCK_Y;
-            int d_yk = pivotCol[offset][k_shared];
-            d_yx[i] = min(d_yx[i], d_yk + d_kx);
+            const int4 d_yk = *reinterpret_cast<const int4*>(&pivotCol[offset][k_shared]);
+            d_yx[i] = min(d_yx[i], d_yk.x + d_kx0);
+            d_yx[i] = min(d_yx[i], d_yk.y + d_kx1);
+            d_yx[i] = min(d_yx[i], d_yk.z + d_kx2);
+            d_yx[i] = min(d_yx[i], d_yk.w + d_kx3);
         }
     }
 
