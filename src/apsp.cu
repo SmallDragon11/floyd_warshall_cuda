@@ -25,8 +25,13 @@
 #define BF 64
 #endif
 
+#ifndef BLOCK_X_P3
+#define BLOCK_X_P3 32
+#endif
+
 // 每個 block 的 thread 形狀：BF × BLOCK_Y（baseline 為 64×4）
 constexpr int BLOCK_Y = 4;
+constexpr int BLOCK_Y_P3 = 8;
 
 // 第 r 輪的 phase 1：pivot block (r, r)
 __global__ void phase1(int* d, int n, int r) {
@@ -90,62 +95,83 @@ __global__ void phase3(int* d, int n, int r) {
         tileNoY += 1;
     }
     
-    int x = tileNoX * BF + threadIdx.x;
+    int x_base = tileNoX * BF;
+    int x_start = x_base + threadIdx.x;
     int y_start = tileNoY * BF + threadIdx.y;
 
     int k_start = r * BF;
     int k_end = (r + 1) * BF;
 
-    int d_yx[BF/BLOCK_Y];
+    int d_yx[BF/BLOCK_Y_P3][BF/BLOCK_X_P3];
 
     __shared__ int pivotRow[BF][BF];
     __shared__ __align__(16) int pivotCol[BF][BF];
 
     // d[y][k] tile, aka pivotCol
-    for (int i=0; i<BF/BLOCK_Y; i++) {
-        int offset = i * BLOCK_Y;
-        int y = y_start + offset;
-        int y_shared = threadIdx.y + offset;
-        int k = k_start + threadIdx.x;
-        pivotCol[y_shared][threadIdx.x] = d[y * n + k];
+    for (int i = 0; i < BF/BLOCK_Y_P3; i++) {
+        int offset_y = i * BLOCK_Y_P3;
+        int y = y_start + offset_y;
+        int y_shared = threadIdx.y + offset_y;
+        for (int j = 0; j < BF/BLOCK_X_P3; j++) {
+            int k_shared = threadIdx.x + j * BLOCK_X_P3;
+            pivotCol[y_shared][k_shared] = d[y * n + k_start + k_shared];
+        }
     }
 
     // d[k][x] tile, aka pivotRow
-    for (int i=0; i<BF/BLOCK_Y; i++) {
-        int offset = threadIdx.y + i * BLOCK_Y;
+    for (int i = 0; i < BF/BLOCK_Y_P3; i++) {
+        int offset = threadIdx.y + i * BLOCK_Y_P3;
         int k = k_start + offset;
-        pivotRow[offset][threadIdx.x] = d[k * n + x];
+        for (int j = 0; j < BF/BLOCK_X_P3; j++) {
+            int x_shared = threadIdx.x + j * BLOCK_X_P3;
+            pivotRow[offset][x_shared] = d[k * n + x_base + x_shared];
+        }
     }
 
     __syncthreads();
     
     #pragma unroll
-    for (int i=0; i<BF/BLOCK_Y; i++) {
-        int y = y_start + i * BLOCK_Y;
-        d_yx[i] = d[y * n + x];
+    for (int i = 0; i < BF/BLOCK_Y_P3; i++) {
+        int y = y_start + i * BLOCK_Y_P3;
+        #pragma unroll
+        for (int j = 0; j < BF/BLOCK_X_P3; j++) {
+            d_yx[i][j] = d[y * n + x_start + j * BLOCK_X_P3];
+        }
     }
 
-    for (int k = k_start; k < k_end; k+=4) {
-        int k_shared = k - k_start;
-        int d_kx0 = pivotRow[k_shared][threadIdx.x];
-        int d_kx1 = pivotRow[k_shared + 1][threadIdx.x];
-        int d_kx2 = pivotRow[k_shared + 2][threadIdx.x];
-        int d_kx3 = pivotRow[k_shared + 3][threadIdx.x];
+    for (int k_shared = 0; k_shared < BF; k_shared += 4) {
+        int d_kx[4][BF/BLOCK_X_P3];
+
         #pragma unroll
-        for (int i=0; i<BF/BLOCK_Y; i++) {
-            int offset = threadIdx.y + i * BLOCK_Y;
+        for (int i = 0; i < 4; i++) {
+            #pragma unroll
+            for (int j = 0; j < BF/BLOCK_X_P3; j++) {
+                int x_shared = threadIdx.x + j * BLOCK_X_P3;
+                d_kx[i][j] = pivotRow[k_shared + i][x_shared];
+            }
+        }
+
+        #pragma unroll
+        for (int i = 0; i < BF/BLOCK_Y_P3; i++) {
+            int offset = threadIdx.y + i * BLOCK_Y_P3;
             const int4 d_yk = *reinterpret_cast<const int4*>(&pivotCol[offset][k_shared]);
-            d_yx[i] = min(d_yx[i], d_yk.x + d_kx0);
-            d_yx[i] = min(d_yx[i], d_yk.y + d_kx1);
-            d_yx[i] = min(d_yx[i], d_yk.z + d_kx2);
-            d_yx[i] = min(d_yx[i], d_yk.w + d_kx3);
+            #pragma unroll
+            for (int j = 0; j < BF/BLOCK_X_P3; j++) {
+                d_yx[i][j] = min(d_yx[i][j], d_yk.x + d_kx[0][j]);
+                d_yx[i][j] = min(d_yx[i][j], d_yk.y + d_kx[1][j]);
+                d_yx[i][j] = min(d_yx[i][j], d_yk.z + d_kx[2][j]);
+                d_yx[i][j] = min(d_yx[i][j], d_yk.w + d_kx[3][j]);
+            }
         }
     }
 
     #pragma unroll
-    for (int i=0; i<BF/BLOCK_Y; i++) {
-        int y = y_start + i * BLOCK_Y;
-        d[y * n + x] = d_yx[i];
+    for (int i = 0; i < BF/BLOCK_Y_P3; i++) {
+        int y = y_start + i * BLOCK_Y_P3;
+        #pragma unroll
+        for (int j = 0; j < BF/BLOCK_X_P3; j++) {
+            d[y * n + x_start + j * BLOCK_X_P3] = d_yx[i][j];
+        }
     }
 }
 
@@ -183,13 +209,13 @@ int main(int argc, char** argv) {
 
     nvtxRangePushA("compute");
 
-    dim3 block(BF, BLOCK_Y);
+    dim3 block(BF, BLOCK_Y), block3(BLOCK_X_P3, BLOCK_Y_P3);
     dim3 grid2(2*rounds-2), grid3(rounds-1, rounds-1);
     if (rounds > 1) {
         for (int r = 0; r < rounds; r++) {
             phase1<<<1, block>>>(d_dist, n, r);
             phase2<<<grid2, block>>>(d_dist, n, r, rounds);
-            phase3<<<grid3, block>>>(d_dist, n, r);
+            phase3<<<grid3, block3>>>(d_dist, n, r);
         }
     } else {
         phase1<<<1, block>>>(d_dist, n, 0);
