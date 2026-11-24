@@ -470,10 +470,15 @@ Long Scoreboard 樣本在 Source 頁的位置：
 
 ## 10. 尚未完成
 
-- 驗證 9.3 的假設：讀 `d_yx` 移到 `__syncthreads()` 之前。
-- 視結果決定是否試 32 × 4（wavefront 2560、occupancy 25%、累積值 32 個）。目前 Duration 已不由 wavefront 決定，預期效益有限（推論）。
-- blocking factor 實驗（BF = 32／64／128）：Integer GOPS、device／shared memory 頻寬；是減少 DRAM 流量的主要手段（見 10.1）。
-- 多 GPU／多節點版的概念討論（未實作、未實測）。
+phase3 剩餘的優化空間（推論）：x2 版 946.91 µs 與 DRAM 下限 821.5 µs 只差約 13%，且 BF = 64 時 DRAM 讀寫量（70.10／34.61 MB）各版不變；最近三版每版只進步約 2%（990 → 965 → 947 µs）。在目前設計下繼續調整 phase3 的報酬已在遞減，接下來的重點依序為：
+
+1. 讀完 pre 版（`d_yx` 移到 `__syncthreads()` 之前，commit `25fa74b`）的 `ncu` 結果，驗證 9.3 的假設。報告：`reports\c06_phase3_pre.ncu-repz`，baseline 為 `c06_phase3_x2`。
+2. 以 Nsight Systems 重看優化後的整個程式：目前只有 baseline 與 y 在外版的 nsys 報告（第 4、5 節）。phase3 加速約 3.6 倍（3.38 ms → 947 µs）後，phase1、phase2、H2D／D2H 佔整體的比例是否變大【待驗證假設】。若 phase3 已不是主要成本，再優化它的意義更小（Amdahl 定律）。
+3. blocking factor 實驗（BF = 32／64；作業要求）：Integer GOPS、device／shared memory 頻寬。預期 BF = 32 輪數加倍、DRAM 流量約加倍而變慢，用來驗證 10.1 的流量關係（推論）。
+4. 選做：BF = 128 時兩個 tile 整塊放進 shared memory 需 128 KB，超過 64 KB 上限。可改為 k 分段載入（例如每次 32 個 k），輪數減半、矩陣進出 DRAM 的次數也減半（推論，未驗證）；需要重新設計 register 分配，工作量較大。
+5. 多 GPU／多節點版的概念討論（未實作、未實測）。
+
+不做：32 × 4（wavefront 2560、occupancy 25%、累積值 32 個）。Duration 已不由 wavefront 決定，預期效益有限（推論）。
 
 ### 10.1 DRAM 流量與 BF 的關係
 
