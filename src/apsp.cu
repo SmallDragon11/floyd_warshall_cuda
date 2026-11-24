@@ -25,12 +25,14 @@
 #define BF 64
 #endif
 
+// phase1、phase2 每個 block 的 thread 形狀：BF × BLOCK_Y（64×4）
+constexpr int BLOCK_Y = 4;
+
+// phase3 每個 block 的 thread 形狀：BLOCK_X_P3 × BLOCK_Y_P3（32×8）
+// 每個 thread 負責 BF/BLOCK_Y_P3 個 y、BF/BLOCK_X_P3 個 x（x、x+BLOCK_X_P3、…）
 #ifndef BLOCK_X_P3
 #define BLOCK_X_P3 32
 #endif
-
-// 每個 block 的 thread 形狀：BF × BLOCK_Y（baseline 為 64×4）
-constexpr int BLOCK_Y = 4;
 constexpr int BLOCK_Y_P3 = 8;
 
 // 第 r 輪的 phase 1：pivot block (r, r)
@@ -100,7 +102,6 @@ __global__ void phase3(int* d, int n, int r) {
     int y_start = tileNoY * BF + threadIdx.y;
 
     int k_start = r * BF;
-    int k_end = (r + 1) * BF;
 
     int d_yx[BF/BLOCK_Y_P3][BF/BLOCK_X_P3];
 
