@@ -123,7 +123,7 @@ ncu --kernel-name phase3 --launch-skip 23 --launch-count 1 --set full --import-s
   | H2D copy | 63.140 ms | 51.787 ms |
   | D2H copy | 51.272 ms | 51.055 ms |
 
-  H2D 多出的 11.4 ms 全部在 GPU 開始搬資料之前（`cudaMemcpy` 開始 1874.273 ms，GPU memcpy 開始 1885.673 ms），來源是 pageable memory。成因是**待驗證假設**：page fault，或第一次 `cudaMemcpy` 的準備成本（見第 10 節）。
+  H2D 多出的 11.4 ms 全部在 GPU 開始搬資料之前（`cudaMemcpy` 開始 1874.273 ms，GPU memcpy 開始 1885.673 ms），來源是 pageable memory。成因是**待驗證假設**：page fault，或第一次 `cudaMemcpy` 的準備成本（見第 11 節）。
 - **c06 phase3（改前）**：`ncu` Duration 23.94 ms；Nsight Systems 47 次平均 23.29 ms（min 22.60、max 24.30）。
   - 【使用者】數字不一致，原因是 profiling overhead 不同。
   - 【待寫】具體原因：單次 vs 平均、`ncu` 鎖時脈、清 cache。可用 `--clock-control none --cache-control none` 驗證。
@@ -375,13 +375,16 @@ Long Scoreboard 樣本在 Source 頁的位置（Profiling Guide：樣本記在�
   - 量測事實只支持「等待原因從 MIO Throttle 轉成 Long Scoreboard，總時間與 DRAM 讀寫量幾乎不變」。為什麼 tile 與 `d_yx` 的 global load 要等更久，確切機制未查明【待驗證假設】：每個 SM 同時有 2 個 block，一個在跑 k 迴圈時另一個可能在載入 tile，兩者共用 L1TEX，可能互相競爭；DRAM 本來就忙（82.93% → 84.84%）。
 - 【待寫】下一步的方向：要減少的是 wavefront 數，而不是指令數；同時 DRAM 已接近 85%，可能成為下一個上限。
 
-## 9. 尚未完成
+## 9. 第五個優化：一個 thread 負責 2 個 x（commit `564cc36`）
 
-- 減少 shared memory wavefront 的下一版 phase3：讓一個 thread 負責 2 個 x，同一次 `pivotCol` 讀取供 2 個 x 使用（預測與設計見 9.1）。
-- blocking factor 實驗（BF = 32／64／128）：Integer GOPS、device／shared memory 頻寬。
-- 多 GPU／多節點版的概念討論（未實作、未實測）。
+phase3 改用自己的 block 形狀 `BLOCK_X_P3 × BLOCK_Y_P3` = 32 × 8（phase1、phase2 維持 64 × 4）。每個 thread 負責 8 個 y、2 個 x（x 與 x+32），累積值為 `d_yx[8][2]`；k 迴圈每次前進 4，每列 y 讀一次 `int4` 的 `pivotCol`，供 2 個 x 共用。
 
-### 9.1 下一版（一個 thread 負責 2 個 x）的預測
+- ptxas：**64 registers**（int4 版 80），32768 bytes smem，0 bytes stack frame。
+- SASS（k 迴圈每次迭代）：`LDS.U` 8 條、`LDS.U.128` 8 條（int4 版 4 條、16 條），`IMNMX` 64 條不變。
+- c01–c06 正確；`compute-sanitizer --tool memcheck`（c03）0 errors。
+- 報告：`reports\c06_phase3_x2.ncu-repz`（c06 第 24 輪 phase3，從 ASCII 路徑編譯），baseline 為 `c06_phase3_int4`。
+
+### 9.1 預測
 
 原理：`pivotCol[y][k]` 對同一列 y 的所有 x 都相同，且為 broadcast 讀取，一個 wavefront 服務整個 warp 涵蓋的 x。現在一個 warp 只涵蓋 32 個 x，同一列 y 的 `pivotCol` 由兩個 warp 各讀一次；一個 thread 負責 2 個 x 後，一個 warp 涵蓋整個 tile 寬度（64），每列只讀一次。`pivotRow[k][x]` 每個 x 都不同，總量省不了。
 
@@ -403,11 +406,76 @@ Long Scoreboard 樣本在 Source 頁的位置（Profiling Guide：樣本記在�
 - 【使用者】兩個上限（推論，前提：Duration 與 wavefront 數成正比；`DRAM: Cycles Active` 近似 DRAM 頻寬利用率；DRAM 讀寫量不變）：
   - shared memory wavefront：964.51 × 3072 / 4608 ≈ **643 µs**。
   - DRAM 忙到 100%：964.51 × 0.8484 ≈ **818 µs**。
-  - Duration 由較慢者決定，所以預測約 818 µs 以上（約 1.18×）。做完後 phase3 的瓶頸可能轉為 DRAM，要再變快須減少 DRAM 流量（見 9.2）。
-- 實作注意：phase1、phase2、phase3 目前共用 `BLOCK_Y`（`src/apsp.cu:29`）與 `dim3 block(BF, BLOCK_Y)`（`src/apsp.cu:186`）。phase1、phase2 維持 64 × 4，phase3 需要自己的 block 形狀常數與 `dim3`；載入 tile 的迴圈也要依新的 thread 排列修改。
-- 量測時要對照：Duration（≥ 818 µs）、每個 block 的 shared wavefront（4608 → 3072）、`DRAM: Cycles Active`（接近 100%）、`dram__throughput`、ptxas register 數（預期與現在相近）。報告存為 `reports\c06_phase3_x2.ncu-repz`。
+  - Duration 由較慢者決定，所以預測約 818 µs 以上（約 1.18×）。做完後 phase3 的瓶頸可能轉為 DRAM，要再變快須減少 DRAM 流量（見 10.1）。
 
-### 9.2 DRAM 流量與 BF 的關係
+### 9.2 實測
+
+| 指標 | int4 | 預測 | x2 |
+|---|---:|---|---:|
+| Duration | 964.51 µs | ≥ 818 µs | **946.91 µs（1.02×）** |
+| block 的 k 迴圈 shared load wavefront（Source 頁逐條加總 ÷ 2116 個 block） | 4608 | 3072 | **3072**（`LDS.U` 2,166,784 + `LDS.U.128` 4,333,568） |
+| shared load wavefront 總數（Raw） | 9,790,266 | — | 6,531,455（−33.3%） |
+| L1/TEX Cache Throughput | 95.34% | — | 70.15% |
+| L1: Data Pipe Lsu Wavefronts | 47.67% | — | 35.07% |
+| `Pipe Lsu`／L1: Lsuin Requests | 58.98%／58.62% | — | 50.81%／50.81% |
+| DRAM: Cycles Active（= DRAM Throughput） | 84.84% | 接近 100% | **86.76%** |
+| DRAM 讀／寫 | 70.09 MB／34.63 MB | 不變 | 70.10 MB／34.61 MB |
+| L2 hit rate | 49.46% | — | 49.49% |
+| Block Limit Registers／Shared Mem | 3／2 | — | 4／2 |
+| Theoretical／Achieved Occupancy | 50%／48.78% | 50% | 50%／48.92% |
+| Executed Instructions | 44,419,072 | — | 43,081,760（−3.0%） |
+| Stall MIO Throttle（cycles／指令） | 2.40 | — | 1.34（−44.07%） |
+| Stall Long Scoreboard（cycles／指令） | 1.53 | — | 2.77（+81%） |
+| Stall Short Scoreboard（cycles／指令） | 1.02 | — | 0.90 |
+
+數據來源：Duration、SOL、Breakdown 取自 GPU Speed Of Light；逐條 wavefront 取自 Source 頁；wavefront 總數、DRAM 位元組、L2 hit rate、Executed Instructions、block limit 取自 Raw 頁（`l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld.sum`、`dram__bytes_{read,write}.sum`、`lts__t_sector_hit_rate.pct`、`smsp__inst_executed.sum`、`launch__occupancy_limit_*`）；stall 取自 Warp State Statistics。Raw 總數換算成每個 warp：6,531,455 / 16,928 ≈ 386，與 3072 / 8 = 384 相近。
+
+PC sampling 的 stall 樣本數（Raw 頁 `smsp__pcsamp_warps_issue_stalled_*`）：
+
+| stall | int4 | x2 | 變化 |
+|---|---:|---:|---:|
+| 總樣本數 | 17,548 | 17,211 | −337 |
+| MIO Throttle | 4,976 | 2,627 | −2,349 |
+| Long Scoreboard | 3,335 | 5,803 | +2,468 |
+| Short Scoreboard | 2,097 | 1,752 | −345 |
+| Not Selected | 1,349 | 1,241 | −108 |
+| Barrier | 364 | 519 | +155 |
+
+Long Scoreboard 樣本在 Source 頁的位置：
+
+| 指令 | int4 | x2 |
+|---|---:|---:|
+| k 迴圈中第一次使用 `d_yx` 的 `IMNMX` | 1,574 | 2,942（佔 50.7%） |
+| 載入 tile 時寫 shared memory 的 `STS` | 1,563 + 159 | 2,216 + 632（佔 49.1%） |
+
+### 9.3 分析
+
+- 【使用者】用利用率反推 100% 時的時間下限：
+
+  | | Duration | L1/TEX 下限 | DRAM 下限 |
+  |---|---:|---:|---:|
+  | int4 | 964.51 µs | 964.51 × 0.9534 ≈ 919.6 µs | 964.51 × 0.8484 ≈ 818.3 µs |
+  | x2 | 946.91 µs | 946.91 × 0.7015 ≈ 664.3 µs | 946.91 × 0.8676 ≈ 821.5 µs |
+
+  x2 版的 L1 下限比 9.1 預測的 643 µs 多約 21 µs；DRAM 下限與預測的 818 µs 只差約 3 µs。實際 Duration 最接近 DRAM 的下限。
+- 【使用者】int4 版的 L1 下限（919.6 µs）和 DRAM 下限（818.3 µs）都接近實際 Duration，是 2 個資源同時接近滿載。x2 版把 wavefront 減少約 1/3，L1 下限降到 664.3 µs，但 Duration 只降 1.8%，因為被 DRAM 卡住。所以「瓶頸是 wavefront 數」要修正為：瓶頸是 DRAM。
+  - 【參考答案，待改寫】補充：int4 版最接近 Duration 的是 L1 下限，DRAM 次之；x2 版換成 DRAM 最接近，但 DRAM 只到 86.76%，Duration 比 DRAM 下限仍多約 125 µs（13%）。所以較精確的說法是「最接近的上限從 shared memory wavefront 換成 DRAM，但 DRAM 也沒有一直保持忙碌」，剩下的差距見下面 Long Scoreboard 與 DRAM 利用率兩點。DRAM 讀寫量（70.10／34.61 MB）與 int4 版相同，所以 DRAM 下限幾乎不變，和每個 block 讀寫 global 的量沒有改變一致（推論）。
+- 【參考答案，待改寫】為什麼 Long Scoreboard 增加：
+  - MIO Throttle 減少的樣本數（−2,349）與 Long Scoreboard 增加的（+2,468）幾乎相同，總樣本數與 Duration 也幾乎不變，和 8.3 的情形一樣：減少的 shared memory 等待，轉成了 global load 的等待。
+  - Long Scoreboard 樣本幾乎全部落在兩個 consumer：`__syncthreads()` 之後讀 `d_yx` 的 `LDG` 的第一個使用者 `IMNMX`（1,574 → 2,942），以及載入 tile 的前兩條 `STS`（1,722 → 2,848）。warp 現在主要在等 global load。
+  - 推論：DRAM 讀寫量不變、DRAM 已近 87%，資料送達的速度大致固定；k 迴圈變快後，warp 更早走到需要 global 資料的指令，等待時間就變長。前提是 DRAM 的有效頻寬是主要限制；驗證方式見下一點的實驗。
+- 【參考答案，待改寫】【待驗證假設】為什麼 DRAM 只到 87%：每個 block 依序執行「載入 tile → `__syncthreads()` → 讀 `d_yx` → k 迴圈 → 寫回」，DRAM 請求只出現在第 1、3、5 段。每個 SM 只放得下 2 個 block（受 shared memory 限制），兩個 block 同時在 k 迴圈時，這個 SM 對 DRAM 沒有需求，因此 DRAM 平均只忙 87%。另外，讀 `d_yx` 排在 barrier 之後，延遲完全沒被遮住，這和第一個 `IMNMX` 累積一半 long_sb 樣本一致；`d_yx` 是每個 thread 自己的 register，邏輯上不需要等 barrier（推論，依據程式碼）。
+  - 驗證實驗：把讀 `d_yx` 的迴圈移到 `__syncthreads()` 之前、與載入 tile 並排。預期：(1) 該 `IMNMX` 的 long_sb 樣本大幅減少；(2) Duration 往 821 µs 靠近、DRAM 利用率提高；(3) register 可能增加，要確認沒有 local memory、occupancy 仍為 50%。若 (1) 成立而 (2) 不明顯，表示主因是「k 迴圈期間 DRAM 閒置」，需要減少總流量（BF 實驗，見 10.1）或讓載入與計算重疊（double buffering）。
+- 對第 11 節「L1/TEX Cache Throughput 為 Data Pipe Lsu Wavefronts 的 2 倍」的檢驗（量測事實）：wavefront 總數減少 33.3% 後，兩者同步下降（95.34% → 70.15%、47.67% → 35.07%），仍恰為 2 倍（70.15 ≈ 2 × 35.07）。L1/TEX Cache Throughput 隨 shared wavefront 數變化這點得到支持；但 Duration 沒有同比例下降，因為 DRAM 上限擋在前面，所以這次實驗無法單獨證明「wavefront 數是 int4 版唯一的瓶頸」。
+
+## 10. 尚未完成
+
+- 驗證 9.3 的假設：讀 `d_yx` 移到 `__syncthreads()` 之前。
+- 視結果決定是否試 32 × 4（wavefront 2560、occupancy 25%、累積值 32 個）。目前 Duration 已不由 wavefront 決定，預期效益有限（推論）。
+- blocking factor 實驗（BF = 32／64／128）：Integer GOPS、device／shared memory 頻寬；是減少 DRAM 流量的主要手段（見 10.1）。
+- 多 GPU／多節點版的概念討論（未實作、未實測）。
+
+### 10.1 DRAM 流量與 BF 的關係
 
 - 每個 block 把 `d[y][x]` 從 DRAM 讀進 register 一次、寫回一次，中間在 k 迴圈中用了 BF 次；pivot tile 的每個值也被用 BF 次。每輪整個矩陣進出 DRAM 一次，共 n / BF 輪，所以 DRAM 總流量約與 n² × (n / BF) 成正比，總計算量 n³ 與 BF 無關（推論）。
 - c06 的量測對照（int4 版）：
@@ -416,7 +484,7 @@ Long Scoreboard 樣本在 Source 頁的位置（Profiling Guide：樣本記在�
   - 讀取中約 34.7 MB 為 `d[y][x]`，其餘約 35 MB 為 pivot tile。若兩個 pivot tile 全部打到 DRAM，讀取應約為 3 倍（約 104 MB），所以約一半的 pivot 讀取在 L2 命中（推論）。哪個 tile 命中【待驗證假設】：看 Memory Workload Analysis 的 L2 hit rate，或 Source 頁逐條 `LDG` 的 L2 sectors。
 - 限制：兩個 tile 的 shared memory 用量為 2 × BF² × 4 B，BF = 128 時 128 KB 超過 sm_75 每個 SM 的 64 KB；BF 越大，phase1 只有一個 block 的序列部分越長（推論，blocking factor 實驗時以 nsys 看各 phase 時間比例驗證）。
 
-## 10. 待驗證問題
+## 11. 待驗證問題
 
 - H2D 投影比 CPU 端區段短 11.4 ms 的原因（page fault，或第一次 `cudaMemcpy` 的準備成本）。驗證方式：連做兩次 H2D，或改用 `cudaMallocHost`。
 - `ncu` 和 Nsight Systems 的 Duration 差異來源（見 4.5）。
@@ -424,4 +492,5 @@ Long Scoreboard 樣本在 Source 頁的位置（Profiling Guide：樣本記在�
 - shared memory 版 bank conflict 總計數器每次執行不同的原因（見 7.2）。
 - 編譯器只把 `pivotCol` 的讀取合併成 `LDS.U.64` 而非 `LDS.U.128` 的原因：「無法證明 16 bytes 對齊」已被 8.1 推翻，實際原因未查明。
 - broadcast 的 `LDS.U.128` 為什麼需要 2 個 wavefront（`LDS.U.64` 只要 1 個）：Profiling Guide 沒有說明 shared memory 各存取寬度的 wavefront 規則。
-- L1/TEX Cache Throughput 恰為 L1: Data Pipe Lsu Wavefronts 的 2 倍（93.17 = 2 × 46.59、95.34 = 2 × 47.67），且大於 Breakdown 中列出的每一項（int4 版最大為 Lsuin Requests 58.62%）。Profiling Guide 說 throughput 取組成計數器的最大值，但沒有這兩個 metric 的定義。推論：throughput 用的組成項與 breakdown 顯示的峰值不同，95.34% 反映的是 wavefront 吞吐量；未驗證。這也是 8.3「wavefront 吞吐量是瓶頸」的前提，驗證方式是下一版減少 wavefront 數後看 Duration 是否同比例下降。
+- L1/TEX Cache Throughput 恰為 L1: Data Pipe Lsu Wavefronts 的 2 倍（93.17 = 2 × 46.59、95.34 = 2 × 47.67），且大於 Breakdown 中列出的每一項（int4 版最大為 Lsuin Requests 58.62%）。Profiling Guide 說 throughput 取組成計數器的最大值，但沒有這兩個 metric 的定義。推論：throughput 用的組成項與 breakdown 顯示的峰值不同，95.34% 反映的是 wavefront 吞吐量；未驗證。x2 版（9.3）中兩者同步下降且仍為 2 倍（70.15 ≈ 2 × 35.07），支持它隨 wavefront 數變化；2 倍的來源仍未查明。
+- x2 版 DRAM 只到 86.76%、Duration 比 DRAM 下限多約 125 µs 的原因（9.3 的假設：k 迴圈期間 DRAM 閒置、`d_yx` 讀取排在 barrier 之後）。驗證方式：讀 `d_yx` 移到 `__syncthreads()` 之前。
