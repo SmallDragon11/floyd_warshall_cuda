@@ -108,6 +108,17 @@ __global__ void phase3(int* d, int n, int r) {
     __shared__ int pivotRow[BF][BF];
     __shared__ __align__(16) int pivotCol[BF][BF];
 
+    // d_yx 只放在自己的 register、不經過 shared memory，所以不必等 __syncthreads()；
+    // 放在載入 tile 之前，讓這批 global load 最先發出，延遲和 tile 的載入重疊
+    #pragma unroll
+    for (int i = 0; i < BF/BLOCK_Y_P3; i++) {
+        int y = y_start + i * BLOCK_Y_P3;
+        #pragma unroll
+        for (int j = 0; j < BF/BLOCK_X_P3; j++) {
+            d_yx[i][j] = d[y * n + x_start + j * BLOCK_X_P3];
+        }
+    }
+
     // d[y][k] tile, aka pivotCol
     for (int i = 0; i < BF/BLOCK_Y_P3; i++) {
         int offset_y = i * BLOCK_Y_P3;
@@ -130,15 +141,6 @@ __global__ void phase3(int* d, int n, int r) {
     }
 
     __syncthreads();
-    
-    #pragma unroll
-    for (int i = 0; i < BF/BLOCK_Y_P3; i++) {
-        int y = y_start + i * BLOCK_Y_P3;
-        #pragma unroll
-        for (int j = 0; j < BF/BLOCK_X_P3; j++) {
-            d_yx[i][j] = d[y * n + x_start + j * BLOCK_X_P3];
-        }
-    }
 
     for (int k_shared = 0; k_shared < BF; k_shared += 4) {
         int d_kx[4][BF/BLOCK_X_P3];
