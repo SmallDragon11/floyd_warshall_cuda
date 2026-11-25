@@ -691,8 +691,7 @@ DRAM 流量與必要量的比較（計算）：
 
 - ptxas：64 registers、32768 bytes smem、0 bytes stack frame。
 - c01–c06 正確；`compute-sanitizer --tool memcheck`（c03）0 errors；`--tool racecheck`（c03、c04）0 hazards。
-- 報告：`reports\c06_phase2_smem.ncu-repz`（baseline 為 `c06_phase2_base`）；`reports\{c06,p01}_p2smem.nsys-rep`；log：`build
-sys_{c06,p01}_p2smem.log`。
+- 報告：`reports\c06_phase2_smem.ncu-repz`（baseline 為 `c06_phase2_base`）；`reports\{c06,p01}_p2smem.nsys-rep`；log：`build\nsys_{c06,p01}_p2smem.log`。
 
 **racecheck 找到的問題**（量測事實）：第一版每步都寫 `self[y][tx] = min(self[y][tx], via)`，racecheck（c03）回報 70,280 個 error。例如 pivot column block 的 thread (0, 2) 寫 `self[2][0]`，同時 thread (32, 2) 在讀 `self[y][k]`（k = 0）。改為「只在 `via` 較小時才寫入」後為 0 hazards。
 
