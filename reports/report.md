@@ -543,7 +543,7 @@ phase3 的有效頻寬為 (70.09 + 34.61) MB ÷ 945.41 µs ≈ 110.75 GB/s。`mi
   - 量測事實：phase3 的 DRAM Throughput 86.99%，DRAM 層級讀寫比相同的 `min2` 為 87.63%。phase3 的有效頻寬 110.75 GB/s，是 `min2`（111.90 GB/s）的 99.0%。`cudaMemcpy` 的 D2D 複製也只有 111.38 GB/s。
   - 推論：以 `min2` 的頻寬當作實際上限，phase3 的下限為 104.70 MB ÷ 111.90 GB/s ≈ **935.7 µs**，實測只多約 10 µs（1%）。9.3 的 821.5 µs 是理論峰值下的下限，這張卡實際上達不到。
   - 所以 9.3 的待驗證假設「DRAM 只到 87% 是因為 k 迴圈期間 DRAM 閒置」**不成立**。x2 版開始，phase3 就已經在實際 DRAM 頻寬上限上。pre 版遮住延遲卻沒有變快，原因相同：DRAM 已經沒有多餘的頻寬。
-- 【參考答案，待改寫】結論：在 BF = 64 的設計下，phase3 已沒有優化空間。
+- 【參考答案，待改寫】結論：在 BF = 64 的設計下，phase3 已沒有優化空間。（**已修正，見 11.4**：DRAM 流量除了加大 BF，還能靠提高 L2 重用來減少；這裡的結論只對「不改 block 執行順序」成立。）
   - 遮住延遲或讓載入與計算重疊，例如 double buffering，只能讓 DRAM 更忙，但 DRAM 已在上限，預期無效（推論）。
   - 要再快，只能減少 DRAM 總流量。依 12.1，流量 ∝ n³ / BF，方法是加大 BF；BF = 128 需要 k 分段載入。
 - 【待驗證假設】只讀能到 92.53%，有寫入時降到 86–88%。可能原因是 DRAM 在讀、寫之間切換方向的成本（未經查證）。驗證方式：用不同讀寫比的串流 kernel（例如 3 : 1、4 : 1）量 DRAM Throughput，看是否隨寫入比例增加而下降。這不影響上面的結論，只解釋為什麼實際上限會隨讀寫比改變。
@@ -743,7 +743,7 @@ PC sampling 的 stall 樣本數（Raw 頁）：
   3. Duration 下降 3.86 倍，且沒有變成 DRAM-bound（DRAM 9.30%），成立。
 - 【參考答案，待改寫】新的瓶頸：L1/TEX 91.26%、SM 87.59%，主要 stall 是 Short Scoreboard、Wait、MIO Throttle，即 shared memory／LSU 的吞吐量。這與第 7 節 phase3 改用 shared memory 後的情形相同（推論）。
 - 【參考答案，待改寫】代價：32 KB 的 shared memory 使每個 SM 只能放 2 個 block，occupancy 從 100% 降到 50%，波數從 2 變為 3（量測事實）。即使如此仍快 3.86 倍，因為消除的是約 28 倍的多餘 DRAM 流量。
-- 【參考答案，待改寫】Amdahl 定律：phase2 在 p01 只剩 6.6%，再優化最多讓 `compute` 少 6.6%；phase3 回到 92.9%，而 9.4 已顯示它在實際 DRAM 頻寬上限上。要再變快只能減少 DRAM 總流量，也就是 blocking factor 實驗與 BF = 128 的 k 分段載入（推論）。
+- 【參考答案，待改寫】Amdahl 定律：phase2 在 p01 只剩 6.6%，再優化最多讓 `compute` 少 6.6%；phase3 回到 92.9%，而 9.4 已顯示它在實際 DRAM 頻寬上限上。要再變快只能減少 DRAM 總流量，也就是 blocking factor 實驗與 BF = 128 的 k 分段載入（推論）。11.4 找到另一個方法：改變 block 執行順序，讓 `pivotRow` 在 L2 命中。
 
 ## 11. Blocking factor 實驗（BF = 32／64）
 
@@ -797,23 +797,60 @@ c06 單次 phase2：BF = 64 為 251.71 µs、92 個 block、Achieved Occupancy 4
 - 【參考答案，待改寫】device memory：12.1 預測 DRAM 總流量 ∝ n³ / BF，BF 減半時流量約加倍。實測整段 phase3 的 DRAM 總量為 1.76 倍，方向成立，但少於 2 倍：
   - 寫入量（約 35 MB／次）兩者相同，等於 phase3 負責的 tile 大小，與預測一致（量測事實）。
   - 讀取中 `d_yx` 約佔 35 MB（BF = 64 為 34.67 MB、BF = 32 為 93² × 32² × 4 B ≈ 35.43 MB），扣掉後 pivot tile 的 DRAM 讀取約從 35.4 MB 降到 21.5 MB（推論，由量測數據相減）。兩者向 L1 要求的 pivot tile 量相同（2116 × 2 × 16 KB ≈ 8649 × 2 × 4 KB ≈ 70 MB），BF = 32 在 L2 命中的比例較高。
-  - 【待驗證假設】原因：每輪的 pivot row 加 pivot column 共 2 × n × BF × 4 B，BF = 64 時約 1.54 MB，大於 1 MB 的 L2；BF = 32 時約 0.77 MB，可放進 L2。驗證方式：比較兩份報告 Source 頁中載入 `pivotRow`、`pivotCol` 的 `LDG` 的 L2 sector 數與 hit rate。
+  - ~~【待驗證假設】原因：每輪的 pivot row 加 pivot column 共 2 × n × BF × 4 B，BF = 64 時約 1.54 MB，大於 1 MB 的 L2；BF = 32 時約 0.77 MB，可放進 L2。~~ **不成立，見 11.4**：差異完全來自 `pivotRow`（BF = 64 幾乎全部 miss，BF = 32 約 41% 命中），`pivotCol` 在兩種 BF 下都幾乎全部命中；原因是重用距離，不是每輪 pivot 的總大小。原本寫的驗證方式（Source 頁逐條 L2 hit rate）也不可行：Source 頁只有 `L2 Theoretical Sectors Global`（要求的 sector 數），沒有逐條指令的 L2 hit。
 - 【參考答案，待改寫】兩種 BF 的 phase3 都受 DRAM 頻寬限制（83–87%）。BF = 32 的 DRAM Throughput 83.30% 略低於 BF = 64，DRAM 層級讀寫比約 1.6 : 1，介於 `copy`（1 : 1，86.43%）與 `min2`（2 : 1，87.63%）之間；有效頻寬 106.31 GB/s 約為這兩者的 96%（推論，見 9.4.2）。所以 BF = 32 的 phase3 也接近實際上限，每次 launch 的工作量減半，時間卻只少 8%。
 - 【參考答案，待改寫】shared memory：BF = 32 的 shared wavefront 總數與 BF = 64 幾乎相同，但 relaxation 只有一半，每次 relaxation 的 wavefront 數加倍（0.0129 → 0.0254）。原因是 BF = 32 時每個 thread 只負責 1 個 x，第 9 節「一個 warp 涵蓋整個 tile 寬度、`pivotCol` 每列只讀一次」的重用消失（推論，依程式碼）。L1/TEX 78.81% 仍低於 DRAM 的接近滿載，所以 shared memory 不是 BF = 32 的主要限制。
 - 【參考答案，待改寫】occupancy：BF = 32 的 shared memory 用量只有 8 KB，Achieved Occupancy 從 48.40% 升到 97.43%，但沒有變快。瓶頸是 DRAM 頻寬，多出來的 warp 無法讓 DRAM 送得更快；occupancy 是遮住延遲的手段，不是目標。
-- 【參考答案，待改寫】結論：在這張卡上，phase3 受 DRAM 頻寬限制，增加 BF 是減少 DRAM 流量的直接方法。BF = 64 已是兩個 tile 整塊放進 shared memory 時，每個 SM 能放 2 個 block 的最大值（2 × 64² × 4 B = 32 KB）；BF = 128 需要 k 分段載入（見第 12 節第 5 項）。
+- 【參考答案，待改寫】結論：在這張卡上，phase3 受 DRAM 頻寬限制，增加 BF 是減少 DRAM 流量的直接方法；另一個方法是提高 L2 重用（見 11.4）。BF = 64 已是兩個 tile 整塊放進 shared memory 時，每個 SM 能放 2 個 block 的最大值（2 × 64² × 4 B = 32 KB）；BF = 128 需要 k 分段載入（見第 12 節第 5 項）。
 - 限制：BF 改變時，phase3 的 thread 分配也跟著改變（每個 thread 負責的 x、y 數不同），所以兩組數據的差異不只來自 BF 本身（推論）。DRAM 流量只取決於 tile 大小，與 thread 分配無關，所以 device memory 的比較不受影響；shared memory 的比較則受影響。
+
+### 11.4 驗證：哪個 pivot tile 在 L2 命中（消去實驗）
+
+Source 頁只有每條指令向 L2 要求的 sector 數（`L2 Theoretical Sectors Global`），沒有逐條指令的 L2 hit，所以無法直接看出 `pivotRow`、`pivotCol` 各自的命中率。改用消去實驗：
+
+- 在 scratch 的原始碼副本中加 `#ifdef SKIP_ROW`／`SKIP_COL`，讓 phase3 不從 global 載入 `pivotRow` 或 `pivotCol`，改為在 shared memory 填 0。結果是錯的，只用來量流量；`src/` 未修改，也不 commit。
+- 拿掉一個 tile 後 DRAM 讀取減少的量，約等於該 tile 原本造成的 DRAM 流量。
+- `ncu --kernel-name phase3 --launch-skip 23 --launch-count 1 --metrics gpu__time_duration.sum,dram__bytes_read.sum,dram__bytes_write.sum,lts__t_sector_hit_rate.pct,lts__t_sectors_srcunit_tex_op_read.sum,lts__t_sectors_srcunit_tex_op_read_lookup_hit.sum`（c06）。只收集這幾個 metric，不用 `--set full`。
+
+| 版本 | Duration | DRAM 讀 | DRAM 寫 | L2 讀取 sector（來自 L1） | 其中 L2 hit |
+|---|---:|---:|---:|---:|---:|
+| BF = 64 原版 | 945.7 µs | 70.10 MB | 34.61 MB | 3,249,216 | 1,059,044 |
+| BF = 64 不載入 `pivotRow` | **679.7 µs** | **35.49 MB** | 34.62 MB | 2,145,896 | 1,038,792 |
+| BF = 64 不載入 `pivotCol` | 938.8 µs | 69.34 MB | 34.61 MB | 2,166,784 | **76** |
+| BF = 32 原版 | 869.3 µs | 56.82 MB | 35.37 MB | 2,454,064 | 677,276 |
+| BF = 32 不載入 `pivotRow` | 688.4 µs | 35.82 MB | 35.37 MB | 1,330,736 | 212,528 |
+| BF = 32 不載入 `pivotCol` | 878.3 µs | 58.62 MB | 35.40 MB | 2,212,280 | 380,648 |
+
+由相減得到各 tile 的 DRAM 讀取（推論，由量測數據相減）：
+
+| tile | BF = 64 | BF = 32 |
+|---|---:|---:|
+| `d_yx` | ≈ 34.7 MB（幾乎全部 miss） | ≈ 35.4 MB（幾乎全部 miss） |
+| `pivotCol` | ≈ 0.8 MB（幾乎全部命中） | ≈ 0（拿掉後反而多 1.8 MB，在雜訊範圍內） |
+| `pivotRow` | ≈ 34.6 MB（L2 hit 約 1.8%） | ≈ 21.0 MB（L2 hit 約 41%） |
+
+BF = 64 的 L2 hit 率由 sector 數計算：拿掉 `pivotRow` 後 L2 讀取少了 1,103,320 個 sector，hit 只少 20,252 個（約 1.8%）；拿掉 `pivotCol` 後剩下的讀取只有 76 個 hit，表示 `d_yx` 與 `pivotRow` 幾乎不命中，L2 的 hit 幾乎都來自 `pivotCol`。BF = 32 拿掉 `pivotRow` 後少了 1,123,328 個 sector，hit 少 464,748 個（約 41%）。
+
+**分析**
+- 【參考答案，待改寫】11.3 的假設不成立。BF = 32 的 DRAM 讀取較少，完全來自 `pivotRow` 的命中率從約 2% 升到約 41%；`pivotCol` 在兩種 BF 下都幾乎全部命中，`d_yx` 都幾乎全部 miss（量測事實與相減推論）。
+- 【參考答案，待改寫】機制是重用距離（推論，前提：block 大致依 `blockIdx.x` 先變的順序被分派）：
+  - `pivotCol` (y, r) 由同一列（同一個 `blockIdx.y`）的 block 共用。這些 block 一個接一個執行，重用距離很短，所以命中。
+  - `pivotRow` (r, x) 由同一行的 block 共用，相鄰兩次使用之間隔了一整列 grid。這段時間經手 L2 的資料量約為 3 × n × BF × 4 B（每個 block 讀 `d_yx`、`pivotRow`，寫回 `d_yx`）：BF = 64 時 46 × 48 KB ≈ 2.3 MB，大於 1 MB 的 L2，下次使用時已被擠出 → 幾乎全部 miss；BF = 32 時 93 × 12 KB ≈ 1.15 MB，與 L2 相當 → 部分命中。
+- 【參考答案，待改寫】這修正了 9.4.3 的結論。BF = 64 拿掉 `pivotRow` 的 DRAM 讀取後，Duration 從 945.7 降到 679.7 µs（−28%），有效頻寬 (35.49 + 34.62) MB ÷ 679.7 µs ≈ 103 GB/s，仍接近實際上限（量測事實）。所以 phase3 的時間幾乎與 DRAM 流量成正比；若能讓 `pivotRow` 也在 L2 命中，phase3 的上限約快 28%（推論；實際做法仍要載入 `pivotRow`，所以這是上限）。
+- 【參考答案，待改寫】方法：block swizzling（或 grouped ordering）。把 grid 切成小方塊依序執行，讓共用同一個 `pivotRow` 的 block 在時間上靠近，同時保留 `pivotCol` 的重用。這需要改 phase3 的 block 編號對應方式（推論，未實作）。
+- 限制：拿掉一個 tile 也會改變其他資料在 L2 中的停留時間，所以相減得到的是近似值。BF = 32 拿掉 `pivotCol` 時 DRAM 讀取反而增加，就是這種交互作用的例子（見第 13 節）。
 
 ## 12. 尚未完成
 
-phase3 剩餘的優化空間（量測事實與推論，見 9.4）：pre 版 945.41 µs，以 DRAM 層級讀寫比相同的串流 kernel 量出的實際 DRAM 上限換算，下限約 935.7 µs，差距只剩約 1%。BF = 64 時 DRAM 讀寫量（70.09／34.61 MB）各版不變，所以在目前設計下 phase3 已沒有優化空間；要再快只能減少 DRAM 總流量（加大 BF）。第 10 節顯示 phase2 曾成為主要成本之一，10.5 改用 shared memory 後在 p01 只剩 6.6%。接下來的重點依序為：
+phase3 剩餘的優化空間（量測事實與推論，見 9.4）：pre 版 945.41 µs，以 DRAM 層級讀寫比相同的串流 kernel 量出的實際 DRAM 上限換算，下限約 935.7 µs，差距只剩約 1%。BF = 64 時 DRAM 讀寫量（70.09／34.61 MB）各版不變，所以在目前的 block 執行順序下 phase3 已沒有優化空間；要再快只能減少 DRAM 總流量：加大 BF，或改變 block 執行順序讓 `pivotRow` 在 L2 命中（11.4，上限約快 28%）。第 10 節顯示 phase2 曾成為主要成本之一，10.5 改用 shared memory 後在 p01 只剩 6.6%。接下來的重點依序為：
 
 1. ~~讀完 pre 版的 `ncu` 結果~~：已完成，見 9.4。
 2. ~~以 Nsight Systems 重看優化後的整個程式~~：已完成，見第 10 節。
 3. ~~phase2 改用 shared memory~~：已完成，見 10.5。phase1 的結構相同，但只佔 0.5%（p01）至 5.4%（c06），暫不處理。
 4. ~~blocking factor 實驗（BF = 32／64）~~：已完成，見第 11 節。BF = 16 需 `-Define BLOCK_X_P3=16`，未做。
-5. 選做：BF = 128 時兩個 tile 整塊放進 shared memory 需 128 KB，超過 64 KB 上限。可改為 k 分段載入（例如每次 32 個 k），輪數減半、矩陣進出 DRAM 的次數也減半（推論，未驗證）；需要重新設計 register 分配，工作量較大。這是 9.4 之後 phase3 唯一還能變快的方向。
-6. 多 GPU／多節點版的概念討論（未實作、未實測）。
+5. **block swizzling**（見 11.4）：改變 phase3 的 block 執行順序，讓共用同一個 `pivotRow` 的 block 在時間上靠近。消去實驗顯示上限約快 28%（945.7 → 679.7 µs），工作量比 k 分段載入小，優先做。
+6. 選做：BF = 128 時兩個 tile 整塊放進 shared memory 需 128 KB，超過 64 KB 上限。可改為 k 分段載入（例如每次 32 個 k），輪數減半、矩陣進出 DRAM 的次數也減半（推論，未驗證）；需要重新設計 register 分配，工作量較大。與 block swizzling 同為減少 DRAM 流量的方向。
+7. 多 GPU／多節點版的概念討論（未實作、未實測）。
 
 不做：
 - 32 × 4（wavefront 2560、occupancy 25%、累積值 32 個）。Duration 已不由 wavefront 決定，預期效益有限（推論）。
@@ -825,7 +862,7 @@ phase3 剩餘的優化空間（量測事實與推論，見 9.4）：pre 版 945.
 - c06 的量測對照（int4 版）：
   - 【使用者】矩陣 3008 × 3008 × 4 B ≈ 36.19 MB；DRAM 讀取 70.09 MB 約為其 2 倍。
   - phase3 的 grid 為 46 × 46（第 r 個 block 列與行由 phase1、phase2 負責），46 × 46 × 64 × 64 × 4 B ≈ 34.67 MB，與 DRAM 寫入 34.63 MB 相符。
-  - 讀取中約 34.7 MB 為 `d[y][x]`，其餘約 35 MB 為 pivot tile。若兩個 pivot tile 全部打到 DRAM，讀取應約為 3 倍（約 104 MB），所以約一半的 pivot 讀取在 L2 命中（推論）。哪個 tile 命中【待驗證假設】：看 Memory Workload Analysis 的 L2 hit rate，或 Source 頁逐條 `LDG` 的 L2 sectors。
+  - 讀取中約 34.7 MB 為 `d[y][x]`，其餘約 35 MB 為 pivot tile。若兩個 pivot tile 全部打到 DRAM，讀取應約為 3 倍（約 104 MB），所以約一半的 pivot 讀取在 L2 命中（推論）。哪個 tile 命中：11.4 的消去實驗顯示是 `pivotCol`（幾乎全部命中），`pivotRow` 幾乎全部 miss（量測事實）。
 - 限制：兩個 tile 的 shared memory 用量為 2 × BF² × 4 B，BF = 128 時 128 KB 超過 sm_75 每個 SM 的 64 KB；BF 越大，phase1 只有一個 block 的序列部分越長（推論，blocking factor 實驗時以 nsys 看各 phase 時間比例驗證）。
 
 ## 13. 待驗證問題
@@ -839,4 +876,6 @@ phase3 剩餘的優化空間（量測事實與推論，見 9.4）：pre 版 945.
 - L1/TEX Cache Throughput 恰為 L1: Data Pipe Lsu Wavefronts 的 2 倍（93.17 = 2 × 46.59、95.34 = 2 × 47.67），且大於 Breakdown 中列出的每一項（int4 版最大為 Lsuin Requests 58.62%）。Profiling Guide 說 throughput 取組成計數器的最大值，但沒有這兩個 metric 的定義。推論：throughput 用的組成項與 breakdown 顯示的峰值不同，95.34% 反映的是 wavefront 吞吐量；未驗證。x2 版（9.3）中兩者同步下降且仍為 2 倍（70.15 ≈ 2 × 35.07），支持它隨 wavefront 數變化；2 倍的來源仍未查明。
 - ~~x2 版 DRAM 只到 86.76%、Duration 比 DRAM 下限多約 125 µs 的原因~~：已由 9.4 解答。87% 已是這張卡在 2 : 1 讀寫比下的實際上限，821.5 µs 是理論峰值下的下限。
 - 串流 kernel 只讀時 DRAM Throughput 92.53%，有寫入時降到 86–88% 的原因（見 9.4.3 的待驗證假設）。
-- BF = 32 的 pivot tile DRAM 讀取較少（約 35.4 → 21.5 MB／次）是否因為每輪 pivot row 加 pivot column（0.77 MB）放得進 1 MB 的 L2（見 11.3）。驗證方式：比較 Source 頁載入 `pivotRow`、`pivotCol` 的 `LDG` 的 L2 sector 數與 hit rate。
+- ~~BF = 32 的 pivot tile DRAM 讀取較少是否因為每輪 pivot row 加 pivot column 放得進 L2~~：不成立，見 11.4。
+- `pivotRow` 命中率由重用距離（一列 grid 經手的資料量 3 × n × BF × 4 B 與 L2 大小的比較）決定（11.4 的推論）。驗證方式：做 block swizzling 後量 phase3 的 DRAM 讀取量，預期 BF = 64 時從約 70 MB 降到約 35 MB。
+- BF = 32 拿掉 `pivotCol` 後，L2 讀取 sector 只少 241,784 個（BF = 32 的 `pivotCol` 約 110 萬個 sector），且 DRAM 讀取反而增加 1.8 MB。推論：同一個 SM 上共用同一個 `pivotCol` 的 block 有一部分在 L1 命中、沒有到達 L2；且拿掉一個 tile 會改變其他資料在 L2 中的停留時間。未驗證，可量 `l1tex__t_sector_hit_rate.pct`。
