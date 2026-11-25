@@ -840,15 +840,72 @@ BF = 64 的 L2 hit 率由 sector 數計算：拿掉 `pivotRow` 後 L2 讀取少�
 - 【參考答案，待改寫】方法：block swizzling（或 grouped ordering）。把 grid 切成小方塊依序執行，讓共用同一個 `pivotRow` 的 block 在時間上靠近，同時保留 `pivotCol` 的重用。這需要改 phase3 的 block 編號對應方式（推論，未實作）。
 - 限制：拿掉一個 tile 也會改變其他資料在 L2 中的停留時間，所以相減得到的是近似值。BF = 32 拿掉 `pivotCol` 時 DRAM 讀取反而增加，就是這種交互作用的例子（見第 13 節）。
 
+### 11.5 block swizzling（commit `0b5d541`）
+
+改動：phase3 改為 1D grid（`grid3((rounds-1) * (rounds-1))`），`blockIdx.x` 代表執行順序，在 kernel 內換算成 tile 座標。每個 block 的工作不變，只改變執行順序。
+
+- 每 `SWIZZLE_G` 列 tile 為一組，組內先往下走（`tileNoY = firstY + idx % rowsInGroup`），走完 G 列再往右（`tileNoX = idx / rowsInGroup`）。最後一組可能不足 G 列（c06 每邊 46 個 tile，最後一組 6 列；c05 每邊 31 個，最後一組 7 列）。
+- `SWIZZLE_G` 預設 8，可用 `-Define` 覆寫；G = 1 等同原本的逐列順序。
+- 前提（推論，未經查證）：硬體大致依 block 編號由小到大分派。
+- c01–c06 正確（BF = 32 抽測 c03、c05、c06 也正確）；memcheck（c04）0 errors。
+- 報告：`reports\c06_phase3_swz.ncu-repz`（G = 8，`--set full`）；`reports\{c06,p01}_swz.nsys-rep`；log：`build\nsys_{c06,p01}_swz.log`；執行檔 `build\apsp_swz.exe`（G = 8）。G 掃描用 11.4 的精簡 `ncu` 指令（只收集 Duration、DRAM 讀寫、L2 hit rate）。
+
+#### 11.5.1 重用距離的估算（預測）
+
+重用距離：同一份資料的兩次使用之間，存取了多少不同的資料。小於 cache 容量就可能命中（推論，前提是 cache 為 fully associative、LRU，實際 L2 不完全符合，只能當估算）。換算成「兩次使用之間執行了幾個 block × 每個 block 經手的新資料」。BF = 64 時每個 block 的 `d_yx` 讀寫各 16 KB（每個 block 不同），`pivotRow`、`pivotCol` 各 16 KB（被多個 block 共用）。
+
+| 順序 | `pivotRow` (r, x) 的重用距離 | `pivotCol` (y, r) 的重用距離 |
+|---|---|---|
+| 逐列（G = 1） | 隔一整列 46 個 block：46 × (32 + 16) KB ≈ **2.2 MB** → miss | 約 1 個 block（≈ 48 KB）→ 命中 |
+| swizzle（G） | 約 1 個 block → 命中 | 隔 G 個 block：G × 32 KB（`d_yx`）+ G × 16 KB（這組的 `pivotCol`）+ 16 KB ≈ **G × 48 KB**；G = 8 約 400 KB，G = 16 約 784 KB |
+
+預測：G 太小時 `pivotRow` 重用次數少；G 太大時 `pivotCol` 的重用距離超過 L2 可用容量。最佳 G 在兩者之間，且應小於 1 MB ÷ 48 KB ≈ 21。
+
+#### 11.5.2 實測（Nsight Compute，c06 單次 phase3）
+
+| G | Duration | DRAM 讀 | L2 hit rate |
+|---:|---:|---:|---:|
+| 1（原本順序） | 952.6 µs | 70.09 MB | 49.45% |
+| 2 | 819.9 µs | 52.81 MB | 61.91% |
+| 4 | 777.9 µs | 44.66 MB | 67.81% |
+| 6 | 747.9 µs | 41.98 MB | 69.74% |
+| **8（採用）** | **750.7 µs** | **41.16 MB** | **70.32%** |
+| 12 | 767.9 µs | 44.54 MB | 67.94% |
+| 16 | 825.8 µs | 50.33 MB | 63.71% |
+| BF = 32，G = 1 → 8 | 871.2 → 762.9 µs | 56.32 → 40.40 MB | 50.66% → 69.17% |
+
+DRAM 寫入各列皆約 34.6 MB（BF = 32 約 35.4 MB），不變。
+
+G = 8 的 `--set full`（`c06_phase3_swz`）：Duration 750.24 µs；DRAM Throughput 79.31%；**L1/TEX Cache Throughput 89.26%**；L2 Cache Throughput 48.87%；Compute (SM) Throughput 64.40%；Achieved Occupancy 48.34%。
+
+#### 11.5.3 整體（Nsight Systems）
+
+| | p01 swizzle 前 | p01 swizzle 後 | c06 swizzle 前 | c06 swizzle 後 |
+|---|---:|---:|---:|---:|
+| phase3 總時間 | 1,708.915 ms | **1,383.125 ms（−19.1%）** | 44.530 ms | 38.117 ms（−14.4%） |
+| phase3 平均 | 10.885 ms | 8.810 ms | 947.5 µs | 811.0 µs |
+| phase2 總時間 | 121.135 ms | 125.942 ms | 13.154 ms | 13.165 ms |
+| `compute` | 1,840.475 ms | **1,519.842 ms（−17.4%）** | 61.596 ms | 55.223 ms（−10.3%） |
+| phase3 佔 kernel 時間 | 92.9% | 91.1% | 73.1% | 69.9% |
+| Integer GOPS（2 × V³ ÷ `compute`） | 1,086.7 | **1,315.9** | 877.6 | 978.8 |
+
+#### 11.5.4 分析
+
+- 【參考答案，待改寫】預測成立：G 從 1 增加到 6–8 時 DRAM 讀取從 70.09 降到約 41 MB，L2 hit rate 從 49% 升到 70%；G 再增加到 12、16 時又變差，表示 `pivotCol` 的重用距離開始超過 L2 可用容量（量測事實與推論）。這也驗證了 11.4 的重用距離推論。
+- 【參考答案，待改寫】最佳 G（6–8，約 300–400 KB）比 1 MB ÷ 48 KB ≈ 21 小得多。可能原因（推論，未驗證）：(1) 同時約有 32 個 block 在執行（每個 SM 2 個 × 16 個 SM），存取窗口比依序執行寬；(2) L2 分成多個 slice、不是 fully associative，可用容量小於 1 MB；(3) 寫回的 `d_yx` 在寫入 DRAM 前也佔用 L2。所以重用距離的估算只能判斷趨勢，實際的 G 要靠掃描決定。
+- 【參考答案，待改寫】DRAM 讀取 41.16 MB，比 11.4 消去實驗的下限 35.49 MB 多約 5.7 MB；Duration 750.7 µs，比消去實驗的 679.7 µs 多約 71 µs。swizzle 後 `pivotRow` 與 `pivotCol` 仍要從 L2 讀、寫進 shared memory，消去實驗連這部分都省掉了，所以 679.7 µs 是達不到的上限（推論）。
+- 【參考答案，待改寫】瓶頸轉移：L1/TEX 89.26% 成為最高的一項，DRAM 降到 79.31%。以利用率反推的下限：L1/TEX 約 750 × 0.8926 ≈ 670 µs；DRAM（以 `min2` 的 87.63% 為實際上限）約 750 × 0.7931 ÷ 0.8763 ≈ 679 µs。兩者又同時接近滿載，類似第 8 節 int4 版的情形；要再變快，需要同時減少 shared memory 的 wavefront 與 DRAM 流量（推論）。
+- 【參考答案，待改寫】整體：p01 的 phase3 少了 19.1%，`compute` 少了 17.4%，Integer GOPS 從 1,086.7 升到 1,315.9。c06 的改善較小（`compute` −10.3%），因為 phase2 在 c06 佔比較高（24%），而 swizzle 只改 phase3（量測事實與推論）。
+
 ## 12. 尚未完成
 
-phase3 剩餘的優化空間（量測事實與推論，見 9.4）：pre 版 945.41 µs，以 DRAM 層級讀寫比相同的串流 kernel 量出的實際 DRAM 上限換算，下限約 935.7 µs，差距只剩約 1%。BF = 64 時 DRAM 讀寫量（70.09／34.61 MB）各版不變，所以在目前的 block 執行順序下 phase3 已沒有優化空間；要再快只能減少 DRAM 總流量：加大 BF，或改變 block 執行順序讓 `pivotRow` 在 L2 命中（11.4，上限約快 28%）。第 10 節顯示 phase2 曾成為主要成本之一，10.5 改用 shared memory 後在 p01 只剩 6.6%。接下來的重點依序為：
+phase3 剩餘的優化空間（量測事實與推論，見 9.4）：pre 版 945.41 µs，以 DRAM 層級讀寫比相同的串流 kernel 量出的實際 DRAM 上限換算，下限約 935.7 µs，差距只剩約 1%。BF = 64 時 DRAM 讀寫量（70.09／34.61 MB）各版不變，所以在目前的 block 執行順序下 phase3 已沒有優化空間；要再快只能減少 DRAM 總流量：加大 BF，或改變 block 執行順序讓 `pivotRow` 在 L2 命中（11.4、11.5：已實作，c06 phase3 快 21%）。第 10 節顯示 phase2 曾成為主要成本之一，10.5 改用 shared memory 後在 p01 只剩 6.6%。接下來的重點依序為：
 
 1. ~~讀完 pre 版的 `ncu` 結果~~：已完成，見 9.4。
 2. ~~以 Nsight Systems 重看優化後的整個程式~~：已完成，見第 10 節。
 3. ~~phase2 改用 shared memory~~：已完成，見 10.5。phase1 的結構相同，但只佔 0.5%（p01）至 5.4%（c06），暫不處理。
 4. ~~blocking factor 實驗（BF = 32／64）~~：已完成，見第 11 節。BF = 16 需 `-Define BLOCK_X_P3=16`，未做。
-5. **block swizzling**（見 11.4）：改變 phase3 的 block 執行順序，讓共用同一個 `pivotRow` 的 block 在時間上靠近。消去實驗顯示上限約快 28%（945.7 → 679.7 µs），工作量比 k 分段載入小，優先做。
+5. ~~block swizzling~~：已完成，見 11.5。c06 phase3 952.6 → 750.7 µs，p01 `compute` −17.4%。之後 phase3 的 L1/TEX 與 DRAM 又同時接近滿載。
 6. 選做：BF = 128 時兩個 tile 整塊放進 shared memory 需 128 KB，超過 64 KB 上限。可改為 k 分段載入（例如每次 32 個 k），輪數減半、矩陣進出 DRAM 的次數也減半（推論，未驗證）；需要重新設計 register 分配，工作量較大。與 block swizzling 同為減少 DRAM 流量的方向。
 7. 多 GPU／多節點版的概念討論（未實作、未實測）。
 
@@ -877,5 +934,7 @@ phase3 剩餘的優化空間（量測事實與推論，見 9.4）：pre 版 945.
 - ~~x2 版 DRAM 只到 86.76%、Duration 比 DRAM 下限多約 125 µs 的原因~~：已由 9.4 解答。87% 已是這張卡在 2 : 1 讀寫比下的實際上限，821.5 µs 是理論峰值下的下限。
 - 串流 kernel 只讀時 DRAM Throughput 92.53%，有寫入時降到 86–88% 的原因（見 9.4.3 的待驗證假設）。
 - ~~BF = 32 的 pivot tile DRAM 讀取較少是否因為每輪 pivot row 加 pivot column 放得進 L2~~：不成立，見 11.4。
-- `pivotRow` 命中率由重用距離（一列 grid 經手的資料量 3 × n × BF × 4 B 與 L2 大小的比較）決定（11.4 的推論）。驗證方式：做 block swizzling 後量 phase3 的 DRAM 讀取量，預期 BF = 64 時從約 70 MB 降到約 35 MB。
+- ~~`pivotRow` 命中率由重用距離決定~~：11.5 的 G 掃描支持此推論（DRAM 讀取 70.09 → 41.16 MB，G 過大時又變差）。
+- 最佳 G（6–8）遠小於以 1 MB L2 估算的約 21 的原因（同時執行的 block、L2 slice 與非 fully associative、寫回資料佔用 L2；見 11.5.4）。
+- swizzle 的前提「硬體大致依 block 編號由小到大分派」未經官方文件查證。
 - BF = 32 拿掉 `pivotCol` 後，L2 讀取 sector 只少 241,784 個（BF = 32 的 `pivotCol` 約 110 萬個 sector），且 DRAM 讀取反而增加 1.8 MB。推論：同一個 SM 上共用同一個 `pivotCol` 的 block 有一部分在 L1 命中、沒有到達 L2；且拿掉一個 tile 會改變其他資料在 L2 中的停留時間。未驗證，可量 `l1tex__t_sector_hit_rate.pct`。
