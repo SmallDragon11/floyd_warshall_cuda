@@ -60,29 +60,47 @@ __global__ void phase2(int* d, int n, int r, int rounds) {
     if (tileNo >= r) {
         tileNo += 1;
     }
-    
-    int x, y_start, y_end;
-    if (blockIdx.x < rounds - 1) { // pivot row
-        x = tileNo * BF + threadIdx.x;
-        y_start = r * BF + threadIdx.y;
-        y_end = (r + 1) * BF;
-    } else { // pivot column
-        x = r * BF + threadIdx.x;
-        y_start = tileNo * BF + threadIdx.y;
-        y_end = (tileNo + 1) * BF;
+
+    // 前 rounds-1 個 block 負責 pivot row（tile (r, tileNo)），其餘負責 pivot column（tile (tileNo, r)）
+    const bool isRow = blockIdx.x < rounds - 1;
+    const int tileY = isRow ? r : tileNo;
+    const int tileX = isRow ? tileNo : r;
+
+    // self：自己的 tile，k 迴圈中原地更新；pivot：tile (r, r)，phase1 已算完、只讀
+    __shared__ int self[BF][BF];
+    __shared__ int pivot[BF][BF];
+
+    const int tx = threadIdx.x;
+    int* const selfBase = d + tileY * BF * n + tileX * BF;
+    int* const pivotBase = d + r * BF * n + r * BF;
+
+    // 從 global 各讀一次：一個 warp 讀同一列連續 32 個 int，合併存取
+    for (int y = threadIdx.y; y < BF; y += BLOCK_Y) {
+        self[y][tx] = selfBase[y * n + tx];
+        pivot[y][tx] = pivotBase[y * n + tx];
+    }
+    __syncthreads();
+
+    // k 必須在外：第 k 步要用到自己 tile 第 k 列（pivot row）或第 k 行（pivot column）
+    // 在第 k-1 步之後的值，而那是其他 thread 算的
+    for (int k = 0; k < BF; k++) {
+        for (int y = threadIdx.y; y < BF; y += BLOCK_Y) {
+            // isRow 對整個 block 相同，不會造成 warp 分歧
+            const int via = isRow ? pivot[y][k] + self[k][tx]   // d[y][k] 在 pivot、d[k][x] 在自己
+                                  : self[y][k] + pivot[k][tx];  // d[y][k] 在自己、d[k][x] 在 pivot
+            // 只在變小時寫入：第 k 列（或行）的 via = d[k][k] + 自己，而 d[k][k] >= 0（權重非負），
+            // 所以第 k 步絕不寫第 k 列（或行），其他 thread 同時讀它不會有 data race，
+            // 同一步內也不需要第二個 barrier
+            if (via < self[y][tx]) {
+                self[y][tx] = via;
+            }
+        }
+        // 第 k 步的寫入要在第 k+1 步讀取前完成
+        __syncthreads();
     }
 
-    int k_start = r * BF;
-    int k_end = (r + 1) * BF;
-
-    for (int k = k_start; k < k_end; k++) {
-        int d_kx = d[k * n + x];
-        for (int y = y_start; y < y_end; y += BLOCK_Y) {
-            int * const d_y = d + y * n;
-            int &d_yx = d_y[x];
-            d_yx = min(d_yx, d_y[k] + d_kx);
-        }
-        __syncthreads();
+    for (int y = threadIdx.y; y < BF; y += BLOCK_Y) {
+        selfBase[y * n + tx] = self[y][tx];
     }
 }
 
