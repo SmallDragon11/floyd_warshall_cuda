@@ -685,13 +685,72 @@ DRAM 流量與必要量的比較（計算）：
   3. Duration 下降，但受 block 數與 tail effect 限制，不會降到 DRAM 下限。
   - 驗證方式：用同一條 `ncu` 指令量新版 phase2，以 `c06_phase2_base` 為 baseline；再用 nsys 看 p01 的 phase2 總時間與 `compute`。
 
+### 10.5 phase2 改用 shared memory（commit `572a9d4`）
+
+改動：自己的 tile（`self`）與 pivot tile（`pivot`，tile (r, r)）各從 global 讀一次放進 shared memory（共 32 KB），k 迴圈只讀寫 shared，最後寫回 global 一次。k 仍在外、每步之後一個 `__syncthreads()`。
+
+- ptxas：64 registers、32768 bytes smem、0 bytes stack frame。
+- c01–c06 正確；`compute-sanitizer --tool memcheck`（c03）0 errors；`--tool racecheck`（c03、c04）0 hazards。
+- 報告：`reports\c06_phase2_smem.ncu-repz`（baseline 為 `c06_phase2_base`）；`reports\{c06,p01}_p2smem.nsys-rep`；log：`build
+sys_{c06,p01}_p2smem.log`。
+
+**racecheck 找到的問題**（量測事實）：第一版每步都寫 `self[y][tx] = min(self[y][tx], via)`，racecheck（c03）回報 70,280 個 error。例如 pivot column block 的 thread (0, 2) 寫 `self[2][0]`，同時 thread (32, 2) 在讀 `self[y][k]`（k = 0）。改為「只在 `via` 較小時才寫入」後為 0 hazards。
+
+- 【參考答案，待改寫】原因：第 k 步更新第 k 列（pivot row）或第 k 行（pivot column）時，`via` = d[k][k] + 自己。權重非負，d[k][k] ≥ 0（補齊用的虛擬點為 INF），所以值不會變。第一版仍會寫入相同的值，形式上與其他 thread 的讀取構成 data race；改為條件寫入後，第 k 列（或行）在第 k 步根本不會被寫，race 從結構上消失，同一步內也不需要第二個 barrier（推論，依演算法；racecheck 0 hazards 支持）。
+
+**Nsight Compute：c06 第 24 輪 phase2**
+
+| 指標 | baseline | shared memory 版 | 10.4 的預測 |
+|---|---:|---:|---|
+| Duration | 970.53 µs | **251.71 µs（3.86×）** | 下降，但不會降到 DRAM 下限 |
+| DRAM 讀／寫 | 13.73／72.34 MB | **1.53／1.44 MB** | 約 1.5／1.5 MB（成立） |
+| DRAM Throughput | 68.76% | 9.30% | — |
+| L1/TEX Cache Throughput | 28.50% | **91.26%** | — |
+| L2 Cache Throughput | 40.94% | 4.21% | — |
+| Compute (SM) Throughput | 19.02% | **87.59%** | — |
+| Block Limit Registers／Shared Mem | 5／16 | 4／**2** | — |
+| Theoretical／Achieved Occupancy | 100%／96.07% | **50%／47.97%** | — |
+| Waves Per SM | 1.44 | **2.88**（2 個 full wave 加上 28 個 block） | — |
+| Executed Instructions | 8,059,936 | 6,462,816 | — |
+
+PC sampling 的 stall 樣本數（Raw 頁）：
+
+| stall | baseline | shared memory 版 |
+|---|---:|---:|
+| 總樣本數 | 15,940 | 4,389 |
+| Long Scoreboard | 12,139（76.2%） | 184（4.2%） |
+| Barrier | 2,421（15.2%） | 233（5.3%） |
+| Short Scoreboard | 0 | 1,474（33.6%） |
+| Wait | 657 | 1,005（22.9%） |
+| MIO Throttle | 5 | 891（20.3%） |
+| Selected | 256 | 294 |
+| Not Selected | 73 | 111 |
+
+**Nsight Systems：整體**
+
+| | p01 pre | p01 shared memory 版 | c06 pre | c06 shared memory 版 |
+|---|---:|---:|---:|---:|
+| phase2 總時間 | 595.021 ms（25.7%） | **121.135 ms（6.6%）** | 46.718 ms（49.5%） | **13.154 ms（21.6%）** |
+| phase2 平均 | 3.790 ms | 771.6 µs | 994.0 µs | 279.9 µs |
+| phase3 總時間 | 1,710.861 ms（73.9%） | 1,708.915 ms（**92.9%**） | 44.453 ms（47.1%） | 44.530 ms（73.1%） |
+| `compute` | 2,315.814 ms | **1,840.475 ms（−20.5%）** | 95.109 ms | **61.596 ms（−35.2%）** |
+
+**分析**
+- 【參考答案，待改寫】10.4 的三個預期：
+  1. DRAM 流量降到必要量（1.53／1.44 MB），成立。
+  2. Long Scoreboard 從 76% 降到 4%，成立；但 Barrier 比例沒有上升（15% → 5%），不成立。總樣本數降到約 1/4，Barrier 樣本也跟著減少；每個 k 的同步成本不是主要瓶頸。
+  3. Duration 下降 3.86 倍，且沒有變成 DRAM-bound（DRAM 9.30%），成立。
+- 【參考答案，待改寫】新的瓶頸：L1/TEX 91.26%、SM 87.59%，主要 stall 是 Short Scoreboard、Wait、MIO Throttle，即 shared memory／LSU 的吞吐量。這與第 7 節 phase3 改用 shared memory 後的情形相同（推論）。
+- 【參考答案，待改寫】代價：32 KB 的 shared memory 使每個 SM 只能放 2 個 block，occupancy 從 100% 降到 50%，波數從 2 變為 3（量測事實）。即使如此仍快 3.86 倍，因為消除的是約 28 倍的多餘 DRAM 流量。
+- 【參考答案，待改寫】Amdahl 定律：phase2 在 p01 只剩 6.6%，再優化最多讓 `compute` 少 6.6%；phase3 回到 92.9%，而 9.4 已顯示它在實際 DRAM 頻寬上限上。要再變快只能減少 DRAM 總流量，也就是 blocking factor 實驗與 BF = 128 的 k 分段載入（推論）。
+
 ## 11. 尚未完成
 
-phase3 剩餘的優化空間（量測事實與推論，見 9.4）：pre 版 945.41 µs，以讀寫比相同的串流 kernel 量出的實際 DRAM 上限換算，下限約 935.7 µs，差距只剩約 1%。BF = 64 時 DRAM 讀寫量（70.09／34.61 MB）各版不變，所以在目前設計下 phase3 已沒有優化空間；要再快只能減少 DRAM 總流量（加大 BF）。第 10 節顯示 phase2 已成為主要成本之一。接下來的重點依序為：
+phase3 剩餘的優化空間（量測事實與推論，見 9.4）：pre 版 945.41 µs，以讀寫比相同的串流 kernel 量出的實際 DRAM 上限換算，下限約 935.7 µs，差距只剩約 1%。BF = 64 時 DRAM 讀寫量（70.09／34.61 MB）各版不變，所以在目前設計下 phase3 已沒有優化空間；要再快只能減少 DRAM 總流量（加大 BF）。第 10 節顯示 phase2 曾成為主要成本之一，10.5 改用 shared memory 後在 p01 只剩 6.6%。接下來的重點依序為：
 
 1. ~~讀完 pre 版的 `ncu` 結果~~：已完成，見 9.4。
 2. ~~以 Nsight Systems 重看優化後的整個程式~~：已完成，見第 10 節。
-3. **phase2 改用 shared memory**（見 10.4 的預測與驗證方式）。phase1 的結構相同，但只佔 0.4%（p01）至 3.5%（c06），之後再決定。
+3. ~~phase2 改用 shared memory~~：已完成，見 10.5。phase1 的結構相同，但只佔 0.5%（p01）至 5.4%（c06），暫不處理。
 4. blocking factor 實驗（BF = 32／64；作業要求）：Integer GOPS、device／shared memory 頻寬。預期 BF = 32 輪數加倍、DRAM 流量約加倍而變慢，用來驗證 11.1 的流量關係（推論）。
 5. 選做：BF = 128 時兩個 tile 整塊放進 shared memory 需 128 KB，超過 64 KB 上限。可改為 k 分段載入（例如每次 32 個 k），輪數減半、矩陣進出 DRAM 的次數也減半（推論，未驗證）；需要重新設計 register 分配，工作量較大。這是 9.4 之後 phase3 唯一還能變快的方向。
 6. 多 GPU／多節點版的概念討論（未實作、未實測）。
