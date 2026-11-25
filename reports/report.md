@@ -134,7 +134,24 @@ ncu --kernel-name phase3 --launch-skip 23 --launch-count 1 --set full --import-s
   | swizzle（G = 8） | 750.7 µs | 811.0 µs | **nsys 長 8.0%** |
 
   - 【使用者】數字不一致，原因是 profiling overhead 不同。
-  - 【待寫】具體原因：單次 vs 平均、`ncu` 鎖時脈、清 cache。swizzle 版差異方向相反且變大，見第 11 節的待驗證問題。
+  - 【待寫】具體原因：單次 vs 平均、`ncu` 鎖時脈、清 cache。
+  - 驗證實驗（c06 第 24 輪 phase3，`ncu --metrics`，CSV 在 scratchpad 未保存）：`ncu` 預設 `--clock-control boost`、`--cache-control all`（官方文件：`ncu --help`）。新增 `sm__cycles_elapsed.avg.per_second`（SM 實際時脈）、`dram__cycles_elapsed.avg.per_second`（DRAM 實際時脈）、`sm__cycles_elapsed.max`（SM cycle 數）。
+
+    | 版本 | clock-control | cache-control | Duration | SM 時脈 | DRAM 時脈 | SM cycles | L1/TEX | DRAM |
+    |---|---|---|---:|---:|---:|---:|---:|---:|
+    | swizzle | boost | all | 752.0 µs | 1,557 MHz | 3,971 MHz | 1,171,841 | — | — |
+    | swizzle | boost | none | 750.6 µs | 1,557 MHz | 4,003 MHz | 1,169,732 | — | — |
+    | swizzle | none | all | 807.9 µs | 1,397 MHz | 3,990 MHz | 1,133,566 | — | — |
+    | swizzle | none | none | 809.5 µs | 1,396 MHz | 3,985 MHz | 1,134,773 | — | — |
+    | swizzle | none | all（重跑） | 807.4 µs | 1,392 MHz | 3,993 MHz | 1,129,324 | **92.46%** | **72.67%** |
+    | pre | boost | all | 948.9 µs | 1,552 MHz | 3,993 MHz | 1,473,899 | 70.47% | 85.99% |
+    | pre | none | all | 946.5 µs | 1,394 MHz | 3,993 MHz | 1,325,546 | 78.70% | 86.21% |
+
+  - 【使用者】決定 Duration 的是 `--clock-control`；`--cache-control` 對所有數值影響不大。
+  - 【參考答案，待改寫】`--clock-control none` 時 swizzle 版為 808–810 µs，與 nsys 平均 811.0 µs 相符：差異來自 `ncu` 把 SM 鎖在 1,557 MHz，而平常執行時 SM 只跑約 1,395 MHz；DRAM 時脈兩者都約 4 GHz（量測事實）。
+  - 【參考答案，待改寫】SM 時脈比 1.11，swizzle 版時間只慢 1.08 倍：只有受 SM 時脈限制的部分（L1/TEX、shared wavefront）變慢，DRAM 部分不變。cycle 數介於「全受 SM 限制」（不變，約 117 萬）與「全受 DRAM 限制」（少 1.11 倍，約 105 萬）之間（推論）。
+  - 【參考答案，待改寫】pre 版受 DRAM 限制，所以預測時脈不鎖時 Duration 不變、L1/TEX 升到約 78%：實測 948.9 → 946.5 µs、L1/TEX 78.70%、cycle 數剛好少 1.11 倍，預測成立。這解釋了為什麼 pre 版兩個工具一致，swizzle 版才出現差距。
+  - baseline `ncu` 比 nsys 長 2.8% 的原因未量測（見第 11 節）。
 
 ### 4.5 小測資的提醒
 
@@ -508,6 +525,7 @@ G = 8 的 `--set full`：Duration 750.24 µs；DRAM Throughput 79.31%；**L1/TEX
 - 【參考答案，待改寫】最佳 G（6–8，約 300–400 KB）比估算的約 21 小得多，可能原因見第 11 節；重用距離的估算只能判斷趨勢，實際的 G 要靠掃描決定。
 - 【參考答案，待改寫】DRAM 讀取 41.16 MB，比消去實驗的 35.49 MB 多約 5.7 MB；Duration 比消去實驗的 679.7 µs 多約 71 µs。消去實驗連從 L2 讀 `pivotRow`、寫進 shared 都省掉了，所以 679.7 µs 是達不到的上限（推論）。
 - 【參考答案，待改寫】瓶頸轉移：以利用率反推的下限，L1/TEX 約 750 × 0.8926 ≈ 670 µs；DRAM（以 `min2` 的 87.63% 為實際上限）約 750 × 0.7931 ÷ 0.8763 ≈ 679 µs。兩者又同時接近滿載（類似 6.4），各自只剩約 10% 的餘裕；要再明顯變快，需要同時減少 shared memory wavefront 與 DRAM 流量（推論）。
+  - **修正（見 4.4）**：上面是 `ncu` 鎖定 boost 時脈（SM 1,557 MHz）下的數字。平常執行時 SM 約 1,395 MHz，L1/TEX 為 92.46%、DRAM 為 72.67%（實際上限 87.63% 的約 83%），所以實際執行時的主要限制是 L1/TEX（shared wavefront），不是兩者同時（量測事實與推論）。
 - 【參考答案，待改寫】c06 的改善較小（`compute` −10.3%），因為 phase2 在 c06 佔 kernel 時間 24%，而 swizzle 只改 phase3。
 
 ## 10. 目前瓶頸與剩餘工作
@@ -524,14 +542,18 @@ G = 8 的 `--set full`：Duration 750.24 µs；DRAM Throughput 79.31%；**L1/TEX
 
 不做：
 - 32 × 4（wavefront 2560、occupancy 25%、累積值 32 個）：同時改變 occupancy 與 register，且 Duration 已不只由 wavefront 決定（推論）。
-- double buffering：原本的理由是「DRAM 已在實際上限」（6.6）。swizzle 後 DRAM 降到實際上限的約 90%，但 L1/TEX 也到 89%，兩個下限（670／679 µs）都只比 750 µs 少約 10%，讓載入與計算重疊最多能拿到這 10%（推論）。
+- double buffering：原本的理由是「DRAM 已在實際上限」（6.6）。swizzle 後在實際時脈下 L1/TEX 為 92.46%、DRAM 為實際上限的約 83%（4.4），主要限制是 L1/TEX；讓 DRAM 載入與計算重疊不會減少 shared wavefront，預期效益有限（推論）。
+
+註：4.4 顯示實際執行時 swizzle 版受 L1/TEX 限制，所以候選 1（k 分段載入，主要減少 DRAM 流量）的效益要重新估算；減少 shared wavefront 的方向優先度上升（推論）。
 
 ## 11. 待驗證問題
 
 | 問題 | 出處 | 驗證方式 |
 |---|---|---|
 | H2D 投影比 CPU 端區段短 11.4 ms 的原因（page fault，或第一次 `cudaMemcpy` 的準備成本） | 4.4 | 連做兩次 H2D，或改用 `cudaMallocHost` |
-| `ncu` 和 nsys 的 Duration 差異來源；swizzle 版 nsys 平均（811.0 µs）反而比 `ncu`（750.7 µs）長 8%，與 baseline 方向相反 | 4.4 | `ncu --clock-control none --cache-control none` 重量；nsys 看各輪 phase3 時間是否隨輪數變化 |
+| ~~swizzle 版 nsys 平均比 `ncu` 長 8%~~：已解答，`ncu` 鎖定 SM 1,557 MHz、平常執行約 1,395 MHz | 4.4 | — |
+| baseline `ncu`（23.94 ms）比 nsys 平均（23.29 ms）長 2.8%：baseline 受 DRAM 限制，時脈不應有影響 | 4.4 | 用 `--clock-control none`、`--cache-control none` 量 baseline 執行檔 |
+| 平常執行時 SM 只到約 1,395 MHz，低於 `ncu` 鎖定的 1,557 MHz 與 `nvidia-smi` 的最高 2,100 MHz（功耗、溫度或 boost 策略，未經查證） | 4.4 | nsys `--gpu-metrics-devices` 取樣整段執行的 SM 時脈；或 `nvidia-smi --query-gpu=clocks.sm,power.draw,temperature.gpu,clocks_throttle_reasons.active -lms 100` |
 | register 重用版 Long Scoreboard 上升的兩個來源（occupancy 下降 vs L2 hit rate 下降） | 6.2 | `__launch_bounds__` 或 `-maxrregcount` 把 register 壓到 64 以下（回到 4 個 block），確認陣列沒被放進 local memory |
 | shared memory bank conflict 總計數器每次執行不同（逐條指令為 0）；可能是 L1 與 shared memory 共用 data bank 的競爭 | 6.3 | 未在文件中查到該計數器的定義，未經查證 |
 | 對齊確定後編譯器仍只用 `LDS.U.64` 而非 `LDS.U.128` 的原因 | 6.4 | 未查明 |
@@ -557,4 +579,5 @@ G = 8 的 `--set full`：Duration 750.24 µs；DRAM Throughput 79.31%；**L1/TEX
 | phase2 改用 shared 後 Barrier 比例會上升 | 不成立：5.3%，同步不是主要成本 | 7.3 |
 | BF = 32 的 pivot 讀取較少，是因為每輪 pivot row + column 放得進 L2 | 不成立：差異完全來自 `pivotRow`，原因是重用距離 | 8.3 |
 | DRAM 總流量 ∝ n³ / BF（BF 減半流量加倍） | 只是簡化模型：實測 1.76×；比例常數取決於 L2 重用 | 8.4 |
-| 不做 double buffering，因為 DRAM 已在實際上限 | swizzle 後 DRAM 約為實際上限的 90%，但 L1/TEX 也到 89%；理由改為「兩個上限都只剩約 10% 餘裕」 | 10 |
+| 不做 double buffering，因為 DRAM 已在實際上限 | swizzle 後實際時脈下 DRAM 約為實際上限的 83%，主要限制是 L1/TEX；理由改為「重疊不會減少 shared wavefront」 | 4.4、10 |
+| swizzle 版 L1/TEX 與 DRAM 同時接近滿載 | 只在 `ncu` 鎖定 boost 時脈時成立；實際時脈下主要是 L1/TEX | 4.4、9.3 |
