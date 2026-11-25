@@ -2,6 +2,7 @@
 // 用法：apsp <input> <output>
 #include <cstdio>
 #include <cstdlib>
+#include <thread>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -217,6 +218,17 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // CUDA 初始化（建立 primary context）不需要輸入資料，交給另一條 host thread，
+    // 與主執行緒的 read input、build matrix 同時進行。
+    // primary context 由同一程式的所有 host thread 共用，所以主執行緒之後的 CUDA 呼叫直接沿用。
+    // 錯誤碼存起來，回到主執行緒再檢查（不在別的 thread 裡呼叫 exit）
+    cudaError_t init_err = cudaSuccess;
+    std::thread init_thread([&init_err] {
+        nvtxRangePushA("CUDA init");
+        init_err = cudaSetDevice(0);  // CUDA 12.0 起，cudaSetDevice 會初始化 runtime 與 primary context
+        nvtxRangePop();
+    });
+
     // NVTX 區段：nvtxRangePushA 開始、nvtxRangePop 結束，對應報告的 time distribution
     int V;
     std::vector<Edge> edges;
@@ -234,8 +246,14 @@ int main(int argc, char** argv) {
     std::vector<int> h_dist = make_dist_matrix(V, edges, n);
     nvtxRangePop();
 
+    // 第一個 CUDA 呼叫之前，確定初始化已完成；若 init 比讀檔＋建矩陣還久，等待時間會落在這一段
+    nvtxRangePushA("wait CUDA init");
+    init_thread.join();
+    nvtxRangePop();
+    CUDA_CHECK(init_err);
+
     int* d_dist = nullptr;
-    nvtxRangePushA("cudaMalloc + CUDA init");  // 第一個 CUDA API 呼叫會連帶做 context 初始化
+    nvtxRangePushA("cudaMalloc");
     CUDA_CHECK(cudaMalloc(&d_dist, bytes));
     nvtxRangePop();
 
