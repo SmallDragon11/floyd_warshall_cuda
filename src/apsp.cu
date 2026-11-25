@@ -33,6 +33,12 @@ constexpr int BLOCK_Y = 4;
 #ifndef BLOCK_X_P3
 #define BLOCK_X_P3 32
 #endif
+
+// phase3 的 block 執行順序（block swizzling）：每 SWIZZLE_G 列 tile 為一組，
+// 組內先往下走完 G 列、再往右換一行。可用 .\build.ps1 -Define SWIZZLE_G=1 還原成逐列順序
+#ifndef SWIZZLE_G
+#define SWIZZLE_G 8
+#endif
 constexpr int BLOCK_Y_P3 = 8;
 
 // 第 r 輪的 phase 1：pivot block (r, r)
@@ -106,8 +112,17 @@ __global__ void phase2(int* d, int n, int r, int rounds) {
 
 // 第 r 輪的 phase 3：其餘 block
 __global__ void phase3(int* d, int n, int r) {
-    int tileNoX = blockIdx.x;
-    int tileNoY = blockIdx.y;
+    // 1D grid：blockIdx.x 是執行順序（推論：硬體大致依 block 編號由小到大分派）。
+    // 換算成 tile 座標，讓連續的 G 個 block 共用同一個 pivotRow (r, x)（同一行），
+    // 而 pivotCol (y, r) 每隔 G 個 block 重用一次，兩者的重用距離都短到能在 L2 命中
+    const int tiles = n / BF - 1;                      // 每列、每行要算的 tile 數（rounds - 1）
+    const int groupSize = SWIZZLE_G * tiles;           // 一組 = G 列 × tiles 行
+    const int group = blockIdx.x / groupSize;
+    const int firstY = group * SWIZZLE_G;
+    const int rowsInGroup = min(SWIZZLE_G, tiles - firstY);  // 最後一組可能不足 G 列
+    const int idx = blockIdx.x % groupSize;
+    int tileNoY = firstY + idx % rowsInGroup;          // 組內先往下走
+    int tileNoX = idx / rowsInGroup;                   // 走完 G 列再往右
     if (tileNoX >= r) {
         tileNoX += 1;
     }
@@ -231,7 +246,8 @@ int main(int argc, char** argv) {
     nvtxRangePushA("compute");
 
     dim3 block(BF, BLOCK_Y), block3(BLOCK_X_P3, BLOCK_Y_P3);
-    dim3 grid2(2*rounds-2), grid3(rounds-1, rounds-1);
+    // phase3 用 1D grid：block 編號到 tile 座標的對應在 kernel 內做（block swizzling）
+    dim3 grid2(2*rounds-2), grid3((rounds-1) * (rounds-1));
     if (rounds > 1) {
         for (int r = 0; r < rounds; r++) {
             phase1<<<1, block>>>(d_dist, n, r);
