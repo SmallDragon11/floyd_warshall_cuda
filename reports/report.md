@@ -123,7 +123,7 @@ ncu --kernel-name phase3 --launch-skip 23 --launch-count 1 --set full --import-s
   | H2D copy | 63.140 ms | 51.787 ms |
   | D2H copy | 51.272 ms | 51.055 ms |
 
-  H2D 多出的 11.4 ms 全部在 GPU 開始搬資料之前（`cudaMemcpy` 開始 1874.273 ms，GPU memcpy 開始 1885.673 ms），來源是 pageable memory。成因是**待驗證假設**：page fault，或第一次 `cudaMemcpy` 的準備成本（見第 11 節）。
+  H2D 多出的 11.4 ms 全部在 GPU 開始搬資料之前（`cudaMemcpy` 開始 1874.273 ms，GPU memcpy 開始 1885.673 ms），來源是 pageable memory。成因是**待驗證假設**：page fault，或第一次 `cudaMemcpy` 的準備成本（見第 12 節）。
 - **c06 phase3（改前）**：`ncu` Duration 23.94 ms；Nsight Systems 47 次平均 23.29 ms（min 22.60、max 24.30）。
   - 【使用者】數字不一致，原因是 profiling overhead 不同。
   - 【待寫】具體原因：單次 vs 平均、`ncu` 鎖時脈、清 cache。可用 `--clock-control none --cache-control none` 驗證。
@@ -406,7 +406,7 @@ phase3 改用自己的 block 形狀 `BLOCK_X_P3 × BLOCK_Y_P3` = 32 × 8（phase
 - 【使用者】兩個上限（推論，前提：Duration 與 wavefront 數成正比；`DRAM: Cycles Active` 近似 DRAM 頻寬利用率；DRAM 讀寫量不變）：
   - shared memory wavefront：964.51 × 3072 / 4608 ≈ **643 µs**。
   - DRAM 忙到 100%：964.51 × 0.8484 ≈ **818 µs**。
-  - Duration 由較慢者決定，所以預測約 818 µs 以上（約 1.18×）。做完後 phase3 的瓶頸可能轉為 DRAM，要再變快須減少 DRAM 流量（見 10.1）。
+  - Duration 由較慢者決定，所以預測約 818 µs 以上（約 1.18×）。做完後 phase3 的瓶頸可能轉為 DRAM，要再變快須減少 DRAM 流量（見 11.1）。
 
 ### 9.2 實測
 
@@ -465,8 +465,8 @@ Long Scoreboard 樣本在 Source 頁的位置：
   - Long Scoreboard 樣本幾乎全部落在兩個 consumer：`__syncthreads()` 之後讀 `d_yx` 的 `LDG` 的第一個使用者 `IMNMX`（1,574 → 2,942），以及載入 tile 的前兩條 `STS`（1,722 → 2,848）。warp 現在主要在等 global load。
   - 推論：DRAM 讀寫量不變、DRAM 已近 87%，資料送達的速度大致固定；k 迴圈變快後，warp 更早走到需要 global 資料的指令，等待時間就變長。前提是 DRAM 的有效頻寬是主要限制；驗證方式見下一點的實驗。
 - 【參考答案，待改寫】【待驗證假設】為什麼 DRAM 只到 87%：每個 block 依序執行「載入 tile → `__syncthreads()` → 讀 `d_yx` → k 迴圈 → 寫回」，DRAM 請求只出現在第 1、3、5 段。每個 SM 只放得下 2 個 block（受 shared memory 限制），兩個 block 同時在 k 迴圈時，這個 SM 對 DRAM 沒有需求，因此 DRAM 平均只忙 87%。另外，讀 `d_yx` 排在 barrier 之後，延遲完全沒被遮住，這和第一個 `IMNMX` 累積一半 long_sb 樣本一致；`d_yx` 是每個 thread 自己的 register，邏輯上不需要等 barrier（推論，依據程式碼）。
-  - 驗證實驗：把讀 `d_yx` 的迴圈移到 `__syncthreads()` 之前、與載入 tile 並排。預期：(1) 該 `IMNMX` 的 long_sb 樣本大幅減少；(2) Duration 往 821 µs 靠近、DRAM 利用率提高；(3) register 可能增加，要確認沒有 local memory、occupancy 仍為 50%。若 (1) 成立而 (2) 不明顯，表示主因是「k 迴圈期間 DRAM 閒置」，需要減少總流量（BF 實驗，見 10.1）或讓載入與計算重疊（double buffering）。
-- 對第 11 節「L1/TEX Cache Throughput 為 Data Pipe Lsu Wavefronts 的 2 倍」的檢驗（量測事實）：wavefront 總數減少 33.3% 後，兩者同步下降（95.34% → 70.15%、47.67% → 35.07%），仍恰為 2 倍（70.15 ≈ 2 × 35.07）。L1/TEX Cache Throughput 隨 shared wavefront 數變化這點得到支持；但 Duration 沒有同比例下降，因為 DRAM 上限擋在前面，所以這次實驗無法單獨證明「wavefront 數是 int4 版唯一的瓶頸」。
+  - 驗證實驗：把讀 `d_yx` 的迴圈移到 `__syncthreads()` 之前、與載入 tile 並排。預期：(1) 該 `IMNMX` 的 long_sb 樣本大幅減少；(2) Duration 往 821 µs 靠近、DRAM 利用率提高；(3) register 可能增加，要確認沒有 local memory、occupancy 仍為 50%。若 (1) 成立而 (2) 不明顯，表示主因是「k 迴圈期間 DRAM 閒置」，需要減少總流量（BF 實驗，見 11.1）或讓載入與計算重疊（double buffering）。
+- 對第 12 節「L1/TEX Cache Throughput 為 Data Pipe Lsu Wavefronts 的 2 倍」的檢驗（量測事實）：wavefront 總數減少 33.3% 後，兩者同步下降（95.34% → 70.15%、47.67% → 35.07%），仍恰為 2 倍（70.15 ≈ 2 × 35.07）。L1/TEX Cache Throughput 隨 shared wavefront 數變化這點得到支持；但 Duration 沒有同比例下降，因為 DRAM 上限擋在前面，所以這次實驗無法單獨證明「wavefront 數是 int4 版唯一的瓶頸」。
 
 ### 9.4 驗證：`d_yx` 讀取移到 `__syncthreads()` 之前（pre 版，commit `25fa74b`），以及 DRAM 實際可達頻寬
 
@@ -543,24 +543,164 @@ phase3 的有效頻寬為 (70.09 + 34.61) MB ÷ 945.41 µs ≈ 110.75 GB/s。`mi
   - 所以 9.3 的待驗證假設「DRAM 只到 87% 是因為 k 迴圈期間 DRAM 閒置」**不成立**。x2 版開始，phase3 就已經在實際 DRAM 頻寬上限上。pre 版遮住延遲卻沒有變快，原因相同：DRAM 已經沒有多餘的頻寬。
 - 【參考答案，待改寫】結論：在 BF = 64 的設計下，phase3 已沒有優化空間。
   - 遮住延遲或讓載入與計算重疊，例如 double buffering，只能讓 DRAM 更忙，但 DRAM 已在上限，預期無效（推論）。
-  - 要再快，只能減少 DRAM 總流量。依 10.1，流量 ∝ n³ / BF，方法是加大 BF；BF = 128 需要 k 分段載入。
+  - 要再快，只能減少 DRAM 總流量。依 11.1，流量 ∝ n³ / BF，方法是加大 BF；BF = 128 需要 k 分段載入。
 - 【待驗證假設】只讀能到 92.53%，有寫入時降到 86–88%。可能原因是 DRAM 在讀、寫之間切換方向的成本（未經查證）。驗證方式：用不同讀寫比的串流 kernel（例如 3 : 1、4 : 1）量 DRAM Throughput，看是否隨寫入比例增加而下降。這不影響上面的結論，只解釋為什麼實際上限會隨讀寫比改變。
 
-## 10. 尚未完成
+## 10. phase3 優化後的整體 profiling 與 phase2 baseline
 
-phase3 剩餘的優化空間（量測事實與推論，見 9.4）：pre 版 945.41 µs，以讀寫比相同的串流 kernel 量出的實際 DRAM 上限換算，下限約 935.7 µs，差距只剩約 1%。BF = 64 時 DRAM 讀寫量（70.09／34.61 MB）各版不變，所以在目前設計下 phase3 已沒有優化空間；要再快只能減少 DRAM 總流量（加大 BF）。接下來的重點依序為：
+phase3 優化到 pre 版（commit `25fa74b`）之後，用 Nsight Systems 重看整個程式，確認 phase3 是否仍是主要成本（Amdahl 定律）。
+
+- 執行檔：`build\apsp_pre.exe`。c06 輸出與參考答案比對 PASS。
+- 報告：`reports\{c06,p01}_pre.nsys-rep`；log：`build\nsys_{c06,p01}_pre.log`。
+- 指令與第 3 節相同，只換 `--output` 與執行檔。
+
+### 10.1 Time distribution（Nsight Systems，`nvtx_sum`）
+
+百分比的分母是 7 個區段的加總，與 4.1 相同。
+
+| 區段 | p01 baseline (ms) | p01 pre (ms) | p01 pre % | c06 baseline (ms) | c06 pre (ms) | c06 pre % |
+|---|---:|---:|---:|---:|---:|---:|
+| read input | 120.781 | 93.599 | 2.29 | 36.028 | 31.022 | 5.06 |
+| build matrix | 1,103.314 | 1,032.298 | 25.21 | 131.637 | 125.312 | 20.44 |
+| cudaMalloc + CUDA init | 340.875 | 308.101 | 7.52 | 349.874 | 287.013 | 46.81 |
+| H2D copy | 63.140 | 59.282 | 1.45 | 6.194 | 6.074 | 0.99 |
+| compute | 41,025.623 | **2,315.814** | **56.54** | 1,143.877 | **95.109** | **15.51** |
+| D2H copy | 51.272 | 51.951 | 1.27 | 5.710 | 4.771 | 0.78 |
+| write output | 266.417 | 234.544 | 5.73 | 63.854 | 63.875 | 10.42 |
+| **合計** | 42,971.422 | **4,095.589** | 100 | 1,737.174 | **613.176** | 100 |
+
+依題目分類（pre 版）：
+
+| 類別 | 組成 | p01 (ms) | p01 % | c06 (ms) | c06 % |
+|---|---|---:|---:|---:|---:|
+| computing | compute | 2,315.814 | 56.54 | 95.109 | 15.51 |
+| memory copy | H2D + D2H | 111.233 | 2.72 | 10.845 | 1.77 |
+| I/O | read input + write output | 328.143 | 8.01 | 94.897 | 15.48 |
+| other | build matrix + cudaMalloc + CUDA init | 1,340.399 | 32.73 | 412.325 | 67.24 |
+| communication | — | 0 | 0 | 0 | 0 |
+
+量測事實：
+- p01 的 `compute` 從 41,025.6 ms 降到 2,315.8 ms（17.7 倍），整個程式從 42,971.4 ms 降到 4,095.6 ms（10.5 倍）。
+- `compute` 以外的區段幾乎不變。p01 的 `build matrix`（CPU 端）約 1.03 s，佔 25.21%，是 GPU 計算時間的 45%。
+- `compute` 區段與 kernel 總時間幾乎相同：p01 是 2,315.8 與 2,314.7 ms，c06 是 95.1 與 94.4 ms。launch 之間的空檔可忽略。
+
+### 10.2 Kernel 佔比（Nsight Systems，`cuda_gpu_kern_sum`）
+
+| kernel | p01 baseline 總時間 | p01 pre 總時間 | p01 pre % | p01 pre 平均 | c06 baseline 總時間 | c06 pre 總時間 | c06 pre % | c06 pre 平均 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| phase3 | 40,420.375 ms | 1,710.861 ms | 73.9 | 10.897 ms | 1,094.790 ms | 44.453 ms | 47.1 | 945.8 µs |
+| phase2 | 596.077 ms | **595.021 ms** | **25.7** | 3.790 ms | 45.354 ms | **46.718 ms** | **49.5** | **994.0 µs** |
+| phase1 | 8.204 ms | 8.794 ms | 0.4 | 56.0 µs | 2.578 ms | 3.274 ms | 3.5 | 69.7 µs |
+
+量測事實：phase2 從 baseline 到現在完全沒有改變。在 c06 上，它的總時間（46.7 ms）已經超過 phase3（44.5 ms），每次 launch（994 µs）也比 phase3（946 µs）長。
+
+**分析**
+- 【參考答案，待改寫】Amdahl 定律：phase3 在 p01 加速 23.6 倍（40,420 → 1,711 ms），但 phase2 不變，所以 `compute` 只加速 17.7 倍。下一個要優化的 kernel 是 phase2。在 p01 上，就算 phase3 再快 10%，`compute` 也只會少約 7%；把 phase2 降到原本的 1/10，`compute` 可以少約 23%（推論）。
+- 【待寫】CPU 端的 `build matrix` 在 p01 佔 25%，是否值得優化，以及它與 GPU 計算能否重疊。
+
+### 10.3 phase2 為何慢：block 數與每個 block 的速度
+
+deviceQuery：16 個 SM，每個 SM 最多 1024 threads、65536 registers、64 KB shared memory，L2 為 1 MB。
+
+`cuobjdump -res-usage`：phase2 是 46 registers、0 shared memory，block 為 64 × 4 = 256 threads。
+
+- 【使用者】每個 SM 可放的 phase2 block 數：threads 限制 1024 / 256 = 4；registers 限制 65536 / (46 × 256) ≈ 5.57；shared memory 無限制。取最小值為 4。16 個 SM 同時可放 64 個 block，c06 每輪 92 個 block 無法同時放下。
+- 【使用者】每波時間（agent 更正為無條件進位）：
+
+| | block 數 | 同時可放 | 波數 | 一次 launch（nsys 平均） | 每波 ≈ 每個 block 的時間 |
+|---|---:|---:|---:|---:|---:|
+| phase3 | 2116 | 2 × 16 = 32 | ⌈66.1⌉ = 67 | 946 µs | ≈ 14 µs |
+| phase2 | 92 | 4 × 16 = 64 | ⌈1.44⌉ = 2 | 994 µs | ≈ 497 µs |
+
+- 【參考答案，待改寫】phase2 慢有兩個獨立的原因（推論，前提：同一波內的 block 大致同時開始、同時結束）：
+  1. GPU 填不滿：每輪只有 92 個 block，第二波只有 28 個，約一半的位置空著。這是演算法結構造成的，phase2 只負責 pivot 的那一列和那一行。
+  2. 每個 block 本身很慢：phase2 與 phase3 的 block 工作量相同（64 × 64 的 tile、64 個 k），phase2 每個 block 約 497 µs，phase3 約 14 µs，相差約 35 倍。
+  - 原因 2 的影響大得多：即使原因 1 完全消除，phase2 也只會從約 994 µs 降到約 497 µs。所以先處理原因 2。
+
+### 10.4 phase2 的 Nsight Compute baseline
+
+- 報告：`reports\c06_phase2_base.ncu-repz`（c06 第 24 輪 phase2，從 ASCII 路徑編譯）。
+- 指令：第 3 節的標準 `ncu` 指令，只把 `--kernel-name` 換成 `phase2`。
+- 為什麼從 Nsight Systems 切到 Nsight Compute：nsys 只能看出 phase2 整體很慢，要知道慢在哪裡（DRAM、L1、stall 原因），需要看 kernel 內部。
+
+| 指標 | phase2 baseline |
+|---|---:|
+| Duration | 970.53 µs |
+| Grid／Block Size | 92／256 |
+| Waves Per SM | 1.44（`ncu`：1 full wave 加上 28 個 thread block 的 partial wave） |
+| Theoretical／Achieved Occupancy | 100%／96.07% |
+| DRAM Throughput | **68.76%**（各項中最高） |
+| L2 Cache Throughput | 40.94% |
+| L1/TEX Cache Throughput | 28.50% |
+| Compute (SM) Throughput | 19.02% |
+| DRAM 讀／寫 | **13.73 MB／72.34 MB** |
+| global load sectors（L1） | 3,956,736（× 32 B ≈ 126.6 MB） |
+| global store sectors | 3,014,656（× 32 B ≈ 96.5 MB） |
+| L1 hit rate／L2 hit rate | 75.46%／89.57% |
+| Executed Instructions | 8,059,936 |
+
+PC sampling 的 stall 樣本數（Raw 頁）：
+
+| stall | 樣本數 | 比例 |
+|---|---:|---:|
+| 總樣本數 | 15,940 | 100% |
+| Long Scoreboard | 12,139 | 76.2% |
+| Barrier | 2,421 | 15.2% |
+| Wait | 657 | 4.1% |
+| Selected | 256 | 1.6% |
+| LG Throttle | 223 | 1.4% |
+
+Source 頁（SASS）：
+- 內層 y 迴圈被展開 4 次。每個 y 執行 2 條 `LDG`（`d_yx`、`d_y[k]`）、`IMAD.IADD`、`IMNMX` 和 1 條 `STG`。每條執行 188,416 次，等於 92 個 block × 8 warps × 64 k × 4。
+- 樣本集中在 4 組 `IMAD.IADD`、`IMNMX`，每條約 1,400–1,850 個。它們是 `LDG` 的 consumer，對應原始碼 `d_yx = min(d_yx, d_y[k] + d_kx);`。
+- `BAR.SYNC` 後的 `ISETP` 有 2,432 個樣本，與 Barrier 總數 2,421 相近，對應 `__syncthreads()`。
+
+DRAM 流量與必要量的比較（計算）：
+
+| | 實際 | 必要量 | 倍數 |
+|---|---:|---:|---:|
+| 讀取 | 13.73 MB | ≈ 1.52 MB（92 個 tile × 16 KB，加上 pivot tile 16 KB） | 約 9 倍 |
+| 寫入 | 72.34 MB | 1.51 MB | 約 48 倍 |
+| 合計 | 86.06 MB | ≈ 3.03 MB | 約 28 倍 |
+
+**分析**
+- 【參考答案，待改寫】phase2 是 latency-bound。各項 throughput 都離 100% 很遠，76% 的樣本是 Long Scoreboard。warp 主要在等 global load，而只有 92 個 block，可輪替的 warp 不足以遮住延遲（推論）。
+- 【參考答案，待改寫】寫入多 48 倍的原因：global store 共 96.5 MB = 64 × 1.51 MB，即每個 k 都把整個 tile 寫回 global 一次（量測事實）。其中 72.3 MB 真的寫到了 DRAM，L2 只擋下約 25%。原因是 92 個 tile 共 1.51 MB，大於 1 MB 的 L2，同一位置下一次被寫入之前就已被擠出 L2（推論）。這與第 4 節 baseline phase3 的寫法相同：k 在外，直接讀寫 global。
+- 【參考答案，待改寫】第 5–7 節的優化能否套用到 phase2（推論，依程式碼與演算法）。關鍵是 phase2 的 tile 依賴它自己：
+
+| block 種類 | `d[y][k]` 來自 | `d[k][x]` 來自 |
+|---|---|---|
+| pivot row（tile (r, j)） | pivot tile (r, r)，phase1 已算完 | 自己的 tile（第 k 列，迴圈中會被更新） |
+| pivot column（tile (i, r)） | 自己的 tile（第 k 行，迴圈中會被更新） | pivot tile (r, r)，phase1 已算完 |
+
+| 優化 | 能否套用 | 原因 |
+|---|---|---|
+| y 在外、k 在內（第 5 節） | 不能 | 第 k 步要用自己 tile 第 k 列（或行）在第 k−1 步之後的值，那是其他 thread 算的。所以必須 k 在外，每步之間 `__syncthreads()`，和 phase1 一樣。 |
+| shared memory（第 7 節） | 能，而且是主要解法 | 自己的 tile 與 pivot tile 只從 global 讀一次，k 迴圈只讀寫 shared，最後寫回一次。DRAM 流量預期從約 86 MB 降到約 3 MB。 |
+| register 重用（第 6 節） | 部分能 | 每個 thread 自己的 `d_yx` 可以留在 register，但其他 thread 需要的第 k 列（或行）必須在 shared memory 中是最新值。 |
+
+- 【待驗證假設】改為 shared memory 版之後預期：
+  1. `dram__bytes_write.sum` 從 72.34 MB 降到約 1.5 MB，讀取降到約 1.5 MB。
+  2. Long Scoreboard 大幅減少，Barrier 比例上升，因為每個 k 都要同步，而且只有 92 個 block。
+  3. Duration 下降，但受 block 數與 tail effect 限制，不會降到 DRAM 下限。
+  - 驗證方式：用同一條 `ncu` 指令量新版 phase2，以 `c06_phase2_base` 為 baseline；再用 nsys 看 p01 的 phase2 總時間與 `compute`。
+
+## 11. 尚未完成
+
+phase3 剩餘的優化空間（量測事實與推論，見 9.4）：pre 版 945.41 µs，以讀寫比相同的串流 kernel 量出的實際 DRAM 上限換算，下限約 935.7 µs，差距只剩約 1%。BF = 64 時 DRAM 讀寫量（70.09／34.61 MB）各版不變，所以在目前設計下 phase3 已沒有優化空間；要再快只能減少 DRAM 總流量（加大 BF）。第 10 節顯示 phase2 已成為主要成本之一。接下來的重點依序為：
 
 1. ~~讀完 pre 版的 `ncu` 結果~~：已完成，見 9.4。
-2. 以 Nsight Systems 重看優化後的整個程式：目前只有 baseline 與 y 在外版的 nsys 報告（第 4、5 節）。phase3 加速約 3.6 倍（3.38 ms → 947 µs）後，phase1、phase2、H2D／D2H 佔整體的比例是否變大【待驗證假設】。若 phase3 已不是主要成本，再優化它的意義更小（Amdahl 定律）。
-3. blocking factor 實驗（BF = 32／64；作業要求）：Integer GOPS、device／shared memory 頻寬。預期 BF = 32 輪數加倍、DRAM 流量約加倍而變慢，用來驗證 10.1 的流量關係（推論）。
-4. 選做：BF = 128 時兩個 tile 整塊放進 shared memory 需 128 KB，超過 64 KB 上限。可改為 k 分段載入（例如每次 32 個 k），輪數減半、矩陣進出 DRAM 的次數也減半（推論，未驗證）；需要重新設計 register 分配，工作量較大。這是 9.4 之後 phase3 唯一還能變快的方向。
-5. 多 GPU／多節點版的概念討論（未實作、未實測）。
+2. ~~以 Nsight Systems 重看優化後的整個程式~~：已完成，見第 10 節。
+3. **phase2 改用 shared memory**（見 10.4 的預測與驗證方式）。phase1 的結構相同，但只佔 0.4%（p01）至 3.5%（c06），之後再決定。
+4. blocking factor 實驗（BF = 32／64；作業要求）：Integer GOPS、device／shared memory 頻寬。預期 BF = 32 輪數加倍、DRAM 流量約加倍而變慢，用來驗證 11.1 的流量關係（推論）。
+5. 選做：BF = 128 時兩個 tile 整塊放進 shared memory 需 128 KB，超過 64 KB 上限。可改為 k 分段載入（例如每次 32 個 k），輪數減半、矩陣進出 DRAM 的次數也減半（推論，未驗證）；需要重新設計 register 分配，工作量較大。這是 9.4 之後 phase3 唯一還能變快的方向。
+6. 多 GPU／多節點版的概念討論（未實作、未實測）。
 
 不做：
 - 32 × 4（wavefront 2560、occupancy 25%、累積值 32 個）。Duration 已不由 wavefront 決定，預期效益有限（推論）。
 - double buffering：DRAM 已在實際上限上，讓載入與計算重疊無法再提高頻寬（推論，見 9.4.3）。
 
-### 10.1 DRAM 流量與 BF 的關係
+### 11.1 DRAM 流量與 BF 的關係
 
 - 每個 block 把 `d[y][x]` 從 DRAM 讀進 register 一次、寫回一次，中間在 k 迴圈中用了 BF 次；pivot tile 的每個值也被用 BF 次。每輪整個矩陣進出 DRAM 一次，共 n / BF 輪，所以 DRAM 總流量約與 n² × (n / BF) 成正比，總計算量 n³ 與 BF 無關（推論）。
 - c06 的量測對照（int4 版）：
@@ -569,7 +709,7 @@ phase3 剩餘的優化空間（量測事實與推論，見 9.4）：pre 版 945.
   - 讀取中約 34.7 MB 為 `d[y][x]`，其餘約 35 MB 為 pivot tile。若兩個 pivot tile 全部打到 DRAM，讀取應約為 3 倍（約 104 MB），所以約一半的 pivot 讀取在 L2 命中（推論）。哪個 tile 命中【待驗證假設】：看 Memory Workload Analysis 的 L2 hit rate，或 Source 頁逐條 `LDG` 的 L2 sectors。
 - 限制：兩個 tile 的 shared memory 用量為 2 × BF² × 4 B，BF = 128 時 128 KB 超過 sm_75 每個 SM 的 64 KB；BF 越大，phase1 只有一個 block 的序列部分越長（推論，blocking factor 實驗時以 nsys 看各 phase 時間比例驗證）。
 
-## 11. 待驗證問題
+## 12. 待驗證問題
 
 - H2D 投影比 CPU 端區段短 11.4 ms 的原因（page fault，或第一次 `cudaMemcpy` 的準備成本）。驗證方式：連做兩次 H2D，或改用 `cudaMallocHost`。
 - `ncu` 和 Nsight Systems 的 Duration 差異來源（見 4.5）。
