@@ -98,7 +98,7 @@ ncu --kernel-name phase3 --launch-skip 23 --launch-count 1 --set full --import-s
 
 **分析**
 - 【使用者】`build matrix` 和 `cudaMalloc + CUDA init` 不屬於題目的三類，另列 other。
-- 【待寫】communication 為何為 0（單 GPU 沒有 GPU 間傳輸）。
+- 【使用者】communication 為 0，因為這個實作只有單一 GPU；H2D 和 D2H 歸類在 memory copy。（證據，量測事實：`p01_swz.nsys-rep` 的 `cuda_gpu_trace` 只有 H2D、D2H 各 1 次 memcpy 與 471 個 kernel，沒有 device 之間的傳輸。可補充：每輪 phase1／2／3 用到的 pivot tile 都在同一份 device memory，kernel 直接讀取，不需要搬移。）
 - 【待寫】other 的組成說明：`build matrix`（CPU 端）在 p01 為 980 ms，佔 30%，約是 GPU 計算時間的 65%；是否值得優化，以及它能否與 GPU 計算重疊。
 
 ### 4.2 Kernel 佔比（Nsight Systems，`cuda_gpu_kern_sum`）
