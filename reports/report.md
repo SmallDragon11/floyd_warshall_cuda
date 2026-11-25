@@ -28,8 +28,9 @@
 | c06 | 3001（補齊至 n = 3008，47 輪） | 正確性 + `ncu` |
 | p01 | 10000（補齊至 n = 10048，157 輪），矩陣 403.849 MB | 只量效能，**輸出未驗證正確性** |
 
-## 2. 實作摘要（目前版本，commit `0b5d541`）
+## 2. 實作摘要（目前版本，commit `505c05f`）
 
+- host 端：CUDA 初始化（`cudaSetDevice(0)`）在另一條 host thread 執行，與 `read input`、`build matrix` 重疊；主執行緒在第一個 CUDA 呼叫（`cudaMalloc`）前 `join`（4.6）。kernel 與 `0b5d541` 相同。
 - 矩陣補齊到 BF 的倍數，補的值填 INF（虛擬點的對角線也是 INF），kernel 不需邊界判斷。
 - 每輪在 default stream 依序 launch `phase1`（1 個 block）、`phase2`（`2*rounds-2` 個 block，前半 pivot row、後半 pivot column）、`phase3`（`(rounds-1)²` 個 block）。迴圈內沒有 host 同步；迴圈結束後的 `cudaDeviceSynchronize()` 只為了讓 NVTX `compute` 區段涵蓋實際的計算時間。
 - 各 phase 的設計：
@@ -42,13 +43,19 @@
 
 ## 3. 量測方法
 
-**Nsight Systems（整體時間線）**：host 程式用 NVTX（`nvtxRangePushA`／`nvtxRangePop`）標出 7 個區段：`read input`、`build matrix`、`cudaMalloc + CUDA init`、`H2D copy`、`compute`、`D2H copy`、`write output`。
+**Nsight Systems（整體時間線）**：host 程式用 NVTX（`nvtxRangePushA`／`nvtxRangePop`）標出 7 個區段：`read input`、`build matrix`、`cudaMalloc + CUDA init`、`H2D copy`、`compute`、`D2H copy`、`write output`。`505c05f` 起，`cudaMalloc + CUDA init` 拆成另一條 thread 上的 `CUDA init`，以及主執行緒的 `wait CUDA init`、`cudaMalloc`。因為區段會重疊，從 4.6 起總時間改用 span（第一個區段開始到最後一個區段結束），不再用各區段相加。
 
 ```
 nsys profile --trace=cuda,nvtx --output=<名稱> --force-overwrite=true --stats=true apsp.exe <input> <output>
 ```
 
 `--stats=true` 產生 `nvtx_sum`、`cuda_api_sum`、`cuda_gpu_kern_sum` 等摘要表（log 存於 `build\nsys_*.log`）。
+
+要看重疊時，用 `nvtx_pushpop_trace` 匯出每一次 NVTX 區段的起訖時間與所在 thread（`nvtx_sum` 只有加總）；`cuda_gpu_trace`、`cuda_api_trace` 分別匯出 GPU 端操作與 CUDA API 呼叫的逐筆紀錄：
+
+```
+nsys stats --force-export=true --report nvtx_pushpop_trace,cuda_gpu_trace,cuda_api_trace --format csv --output . <報告>.nsys-rep
+```
 
 **Nsight Compute（kernel 內部）**：
 
@@ -87,7 +94,7 @@ ncu --kernel-name phase3 --launch-skip 23 --launch-count 1 --set full --import-s
 | other | build matrix + cudaMalloc + CUDA init | 3.36 | 1,233.259 | 37.98 | 395.242 | 72.95 |
 | communication | — | 0 | 0 | 0 | 0 | 0 |
 
-量測事實：p01 的 `compute` 從 41,025.6 ms 降到 1,519.8 ms（27.0 倍），整個程式從 42,971.4 ms 降到 3,247.0 ms（13.2 倍）。`compute` 以外的區段變化不大（`write output` 在 234.5–302.9 ms 之間浮動），所以現在 p01 有一半以上的時間不在 GPU 計算。
+量測事實：p01 的 `compute` 從 41,025.6 ms 降到 1,519.8 ms（27.0 倍），整個程式從 42,971.4 ms 降到 3,247.0 ms（13.2 倍）。`compute` 以外的區段變化不大（`write output` 在 234.5–302.9 ms 之間浮動），所以現在 p01 有一半以上的時間不在 GPU 計算。（本節為 `0b5d541` 的數據；CUDA 初始化改到另一條 thread 之後的 time distribution 見 4.6。）
 
 **分析**
 - 【使用者】`build matrix` 和 `cudaMalloc + CUDA init` 不屬於題目的三類，另列 other。
@@ -124,7 +131,7 @@ ncu --kernel-name phase3 --launch-skip 23 --launch-count 1 --set full --import-s
   | H2D copy | 63.140 ms | 51.787 ms |
   | D2H copy | 51.272 ms | 51.055 ms |
 
-  H2D 多出的 11.4 ms 全部在 GPU 開始搬資料之前，來源是 pageable memory；成因見第 11 節。
+  H2D 多出的 11.4 ms 全部在 GPU 開始搬資料之前。原本推論來源是 pageable memory，但 4.6 的實驗 A 同樣是 pageable，空檔只有 0.3 ms，所以成因改列為待驗證（4.6、第 11 節）。
 - **kernel Duration**（c06 單次 phase3，`ncu` vs nsys 47 次平均）：
 
   | 版本 | `ncu` | nsys 平均 | 差異 |
@@ -159,6 +166,80 @@ ncu --kernel-name phase3 --launch-skip 23 --launch-count 1 --set full --import-s
 
 （補充數據：`cudaMalloc + CUDA init` 的絕對時間兩者相近，c06 目前佔 51.53%、p01 只佔 7.79%。）
 
+### 4.6 CUDA 初始化與讀檔、建矩陣重疊（commit `505c05f`）
+
+**動機（時間線證據）**：`reports\p01_swz.nsys-rep` 中 7 個 NVTX 區段在同一條 thread 依序執行，彼此沒有重疊；GPU 只用一個 stream（Stream 7），第一個 GPU 操作是 1,561.2 ms（自程式啟動起算）開始的 H2D。`read input` 與 `build matrix`（231.0–1,297.0 ms）期間 GPU 完全閒置，因為 context 要到 `cudaMalloc` 才建立（量測事實：`nvtx_pushpop_trace`、`cuda_gpu_trace`）。
+
+**相鄰區段的依賴關係**（推論，依 `src/apsp.cu` 的 host 流程）：
+
+| 相鄰兩段 | 依賴 | 理由 |
+|---|---|---|
+| (read／build) → CUDA init | 無 | 初始化不需要任何輸入資料；`cudaMalloc` 只需要 `bytes`（讀完檔頭即知） |
+| build matrix → H2D | 部分 | 填好的列 tile 可先送 |
+| H2D → compute | 幾乎全部 | phase3 第 0 輪就用到整個矩陣 |
+| compute → D2H | 全部 | 最後一輪 phase3 會更新所有 tile |
+| D2H → write output | 部分 | 傳回的列可先寫出 |
+
+**重疊的收益上限**（兩段完全重疊最多省下較短的一段；p01 數據取自 4.1）：
+
+| 組合 | 上限 | 佔 3,247.0 ms |
+|---|---:|---:|
+| CUDA init ∥ read input + build matrix | 252.9 ms | 7.8% |
+| build matrix ∥ H2D（分塊，需 pinned memory、`cudaMemcpyAsync`、非 default stream） | 56.2 ms | 1.7% |
+| D2H ∥ write output（分塊，同上） | 49.2 ms | 1.5% |
+| H2D ∥ compute | ≈ 0 | — |
+
+**實驗**（p01，nsys，單位 ms；起點為自第一個 NVTX 區段開始起算）：
+
+- swz：`0b5d541`，同一批重跑的對照組（`reports\p01_swz_r2.nsys-rep`）。
+- 實驗 A：只把 `cudaMalloc` 移到 `build matrix` 前面（`build\apsp_mvinit.exe`，原始碼未進 git；`reports\p01_mvinit.nsys-rep`）。
+- thread 版：`505c05f`，`std::thread` 在程式一開始呼叫 `cudaSetDevice(0)`。從 CUDA 12.0 起，`cudaSetDevice` 會初始化 runtime 與 primary context，且 primary context 由程式的所有 host thread 共用（官方文件：CUDA Programming Guide 2.1.6 Runtime Initialization，https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/intro-to-cuda-cpp.html#runtime-initialization ）。thread 的錯誤碼回到主執行緒再檢查（`reports\p01_initthr.nsys-rep` 為第 1 次）。
+
+| 區段 | swz | 實驗 A | thread 版 第 1 次 | thread 版 第 2 次 |
+|---|---:|---:|---:|---:|
+| read input | 91.2 | 89.9 | 87.6 | 88.6 |
+| init（swz、A 為 `cudaMalloc + CUDA init`） | 311.8 | 268.7（在 build 之前） | 279.5（另一條 thread，0 ms 起） | 269.9（同左） |
+| build matrix | 1,004.4 | 1,020.3 | 1,039.0 | 1,014.6 |
+| wait CUDA init | — | — | **0.0** | **0.0** |
+| cudaMalloc | — | — | **1.0** | **0.9** |
+| H2D 開始時間 | 1,407.4 | 1,379.0 | **1,127.6** | **1,104.2** |
+| compute | 1,529.6 | 1,535.4 | 1,533.4 | 1,532.5 |
+| write output | 257.4 | 328.3 | 221.3 | 260.1 |
+| **span** | **3,305.4** | **3,342.6** | **2,994.7** | **3,013.2** |
+
+正確性：c01–c06 `cmp.exe` 通過；p01 與 swz 版輸出逐值一致。
+
+thread 版第 1 次的 time distribution（主執行緒；分母為 span 2,994.7 ms，`CUDA init` 與主執行緒重疊所以不另列百分比）：
+
+| 區段 | ms | % |
+|---|---:|---:|
+| read input | 87.6 | 2.93 |
+| build matrix | 1,039.0 | 34.69 |
+| wait CUDA init + cudaMalloc | 1.0 | 0.03 |
+| H2D copy | 56.9 | 1.90 |
+| compute | 1,533.4 | 51.20 |
+| D2H copy | 51.7 | 1.73 |
+| （`cudaFree`，未標 NVTX） | 3.8 | 0.13 |
+| write output | 221.3 | 7.39 |
+
+**H2D 前的空檔**（`cuda_api_trace`、`cuda_gpu_trace`；空檔 = GPU memcpy 開始 − NVTX `H2D copy` 開始）：
+
+| 版本 | `cudaMalloc` API (ms) | NVTX H2D (ms) | GPU memcpy (ms) | 空檔 (ms) | `cudaMalloc` 到 H2D 之間 |
+|---|---:|---:|---:|---:|---|
+| swz | 122.2 | 57.9 | 46.6 | 11.4 | 緊接 |
+| 實驗 A | 76.8 | 45.8 | 45.6 | **0.3** | 隔著 `build matrix`（約 1 s） |
+| thread 版 第 1 次 | 1.0 | 56.9 | 45.5 | 11.4 | 緊接 |
+| thread 版 第 2 次 | 0.8 | 60.4 | 48.5 | 11.9 | 緊接 |
+
+**分析**
+- 【參考答案，待改寫】只把 `cudaMalloc` 往前移沒有效果：NVTX 記錄的是 CPU thread 的時間，第一個 CUDA 呼叫會連帶建立 context，主執行緒卡在 `cudaMalloc` 裡 269–312 ms 不能做別的事。所有區段仍在同一條 thread 依序執行，調換順序只改變 init 的位置，總時間不變（span 3,305.4 vs 3,342.6 ms，差異小於 `write output` 單項的浮動 71 ms）。
+- 【參考答案，待改寫】thread 版真的重疊：初始化不依賴輸入資料，可在程式一開始就由另一條 thread 進行；它只要 270–280 ms，比 `read input` + `build matrix`（約 1,100 ms）短，所以完全被遮住，`wait CUDA init` 為 0.0 ms。H2D 開始時間提早 280–303 ms，span 約 3,305 → 3,000 ms（約 −9%），與上限（init 本身的時間）一致。
+- 【參考答案，待改寫】主執行緒的 `cudaMalloc` 只剩約 1 ms，表示舊版 `cudaMalloc + CUDA init` 的 253–312 ms 幾乎全是 context 初始化，配置 404 MB device memory 本身很便宜。
+- 【參考答案，待改寫】這次的重疊發生在 CPU 的兩條 thread 之間，不是 GPU 上的 stream 重疊：在 nsys 中要看 `Processes → Threads` 底下兩條 thread 的 NVTX 列，`CUDA HW` 列沒有變化。GPU 端的 stream 重疊（分塊 H2D／D2H）上限只有 56／49 ms（1.7%／1.5%），且需要 pinned memory 與非 default stream，成本效益低，所以不做。
+- 【參考答案，待改寫】`build matrix` 沒有明顯被 init thread 拖慢（thread 版 1,015–1,039 ms，對照 1,004–1,020 ms），但只有兩次樣本，無法排除 10–30 ms 的資源競爭。
+- 【參考答案，待改寫】改完後主執行緒的關鍵路徑是 `compute`（51.2%）與 `build matrix`（34.7%）；`build matrix` 是 CPU 端單執行緒的工作，已成為第二大成本。
+- 【待驗證假設】H2D 前的約 11.4 ms 空檔只在 `cudaMalloc` 緊接 H2D 時出現，實驗 A 兩者相隔約 1 s 時只有 0.3 ms，而四個版本的來源都是 pageable memory。推測空檔是 `cudaMalloc` 之後第一次使用該 device 記憶體的準備成本，而不是 pageable memory 本身（未經查證，實驗 A 只有一次）。驗證：重跑實驗 A 確認可重現；在 thread 版的 `cudaMalloc` 與 H2D 之間插入固定等待（例如 100 ms），看空檔是否消失；或改用 `cudaMallocHost` 比較。
+
 ## 5. 優化總覽
 
 c06 單次 phase3（`ncu`）與 p01 的 `compute`（nsys）。「主要限制」以 SOL 最高項與利用率反推的下限判斷（推論）。
@@ -174,6 +255,7 @@ c06 單次 phase3（`ncu`）與 p01 的 `compute`（nsys）。「主要限制」
 | pre | `25fa74b` | `d_yx` 在 barrier 前讀 | 945.41 µs | DRAM（實際上限的 99%） | 2,315.8 ms | 863.6 |
 | phase2 shared | `572a9d4` | phase2 改用 shared（phase2 970.53 → 251.71 µs） | （不變） | — | 1,840.5 ms | 1,086.7 |
 | swizzle | `0b5d541` | 1D grid、G = 8 | 750.7 µs | L1/TEX + DRAM 同時接近滿載 | **1,519.8 ms** | **1,315.9** |
+| init thread | `505c05f` | CUDA 初始化另開 host thread，與讀檔、建矩陣重疊（4.6） | （不變） | — | （不變；p01 整個程式 3,305 → 約 3,000 ms） | — |
 
 GOPS 為 2 × 10000³ ÷ `compute`（計算值）；中間版本沒有量 p01 的 nsys。
 
@@ -530,17 +612,18 @@ G = 8 的 `--set full`：Duration 750.24 µs；DRAM Throughput 79.31%；**L1/TEX
 
 ## 10. 目前瓶頸與剩餘工作
 
-目前狀態（量測事實）：p01 `compute` 1,519.8 ms、Integer GOPS 1,315.9；phase3 佔 kernel 時間 91.1%，c06 單次 phase3 的 L1/TEX 89.26%、DRAM 79.31%（實際上限的約 90%）；phase2 佔 8.3%、phase1 佔 0.6%（c06 為 24.1%、6.0%）。整個程式中 `compute` 只佔 p01 的 46.81%，CPU 端的 `build matrix` 佔 30.19%（4.1）。
+目前狀態（量測事實）：p01 `compute` 1,519.8 ms、Integer GOPS 1,315.9；phase3 佔 kernel 時間 91.1%，c06 單次 phase3 的 L1/TEX 89.26%、DRAM 79.31%（實際上限的約 90%）；phase2 佔 8.3%、phase1 佔 0.6%（c06 為 24.1%、6.0%）。整個程式中 `compute` 只佔 p01 的 46.81%，CPU 端的 `build matrix` 佔 30.19%（4.1）。CUDA 初始化改到另一條 thread 後（`505c05f`），p01 span 約 3,000 ms，`compute` 佔 51.20%、`build matrix` 佔 34.69%（4.6）。
 
 候選（推論，未驗證）：
 
 1. **k 分段載入以支援 BF = 128**：兩個 tile 整塊放進 shared memory 需 128 KB，超過 64 KB；改為每次載入一段 k，輪數減半、矩陣進出 DRAM 的次數也減半。但 L1/TEX 也接近滿載，做之前要先估算 shared wavefront 是否成為新瓶頸；需要重新設計 register 分配，工作量大。
 2. **補 BF = 16 資料點**：需 `-Define BF=16,BLOCK_X_P3=16`（否則 `BF/BLOCK_X_P3` 為 0，程式會壞）。
 3. **phase1 改用 shared memory**：結構與 phase2 相同，但只佔 p01 的 0.6%，價值低。BF = 32 時 phase1 總時間較短（p01 9.157 → 4.974 ms），BF 越大序列部分越長（量測事實，8.1），但 BF = 64 時仍只佔約 0.5%。
-4. **CPU 端 `build matrix`**：p01 佔 30%，不在 GPU 上；是否處理由使用者決定（見 4.1 的【待寫】）。
+4. **CPU 端 `build matrix`**：p01 佔 30%（`505c05f` 後 34.7%），不在 GPU 上；是否處理由使用者決定（見 4.1 的【待寫】）。
 5. 多 GPU／多節點版的概念討論（未實作、未實測）。
 
 不做：
+- 分塊 H2D／D2H（stream + pinned memory）與 `build matrix`／`write output` 重疊：上限 56／49 ms（1.7%／1.5%），成本效益低（4.6）。
 - 32 × 4（wavefront 2560、occupancy 25%、累積值 32 個）：同時改變 occupancy 與 register，且 Duration 已不只由 wavefront 決定（推論）。
 - double buffering：原本的理由是「DRAM 已在實際上限」（6.6）。swizzle 後在實際時脈下 L1/TEX 為 92.46%、DRAM 為實際上限的約 83%（4.4），主要限制是 L1/TEX；讓 DRAM 載入與計算重疊不會減少 shared wavefront，預期效益有限（推論）。
 
@@ -550,7 +633,7 @@ G = 8 的 `--set full`：Duration 750.24 µs；DRAM Throughput 79.31%；**L1/TEX
 
 | 問題 | 出處 | 驗證方式 |
 |---|---|---|
-| H2D 投影比 CPU 端區段短 11.4 ms 的原因（page fault，或第一次 `cudaMemcpy` 的準備成本） | 4.4 | 連做兩次 H2D，或改用 `cudaMallocHost` |
+| H2D 投影比 CPU 端區段短 11.4 ms 的原因。`cudaMalloc` 與 H2D 相隔約 1 s 時只有 0.3 ms（4.6 實驗 A，單次），推測是 `cudaMalloc` 後第一次使用 device 記憶體的準備成本，而非 pageable memory | 4.4、4.6 | 重跑實驗 A；在 `cudaMalloc` 與 H2D 之間插入固定等待；或改用 `cudaMallocHost` |
 | ~~swizzle 版 nsys 平均比 `ncu` 長 8%~~：已解答，`ncu` 鎖定 SM 1,557 MHz、平常執行約 1,395 MHz | 4.4 | — |
 | baseline `ncu`（23.94 ms）比 nsys 平均（23.29 ms）長 2.8%：baseline 受 DRAM 限制，時脈不應有影響 | 4.4 | 用 `--clock-control none`、`--cache-control none` 量 baseline 執行檔 |
 | 平常執行時 SM 只到約 1,395 MHz，低於 `ncu` 鎖定的 1,557 MHz 與 `nvidia-smi` 的最高 2,100 MHz（功耗、溫度或 boost 策略，未經查證） | 4.4 | nsys `--gpu-metrics-devices` 取樣整段執行的 SM 時脈；或 `nvidia-smi --query-gpu=clocks.sm,power.draw,temperature.gpu,clocks_throttle_reasons.active -lms 100` |
@@ -581,3 +664,4 @@ G = 8 的 `--set full`：Duration 750.24 µs；DRAM Throughput 79.31%；**L1/TEX
 | DRAM 總流量 ∝ n³ / BF（BF 減半流量加倍） | 只是簡化模型：實測 1.76×；比例常數取決於 L2 重用 | 8.4 |
 | 不做 double buffering，因為 DRAM 已在實際上限 | swizzle 後實際時脈下 DRAM 約為實際上限的 83%，主要限制是 L1/TEX；理由改為「重疊不會減少 shared wavefront」 | 4.4、10 |
 | swizzle 版 L1/TEX 與 DRAM 同時接近滿載 | 只在 `ncu` 鎖定 boost 時脈時成立；實際時脈下主要是 L1/TEX | 4.4、9.3 |
+| H2D 前多出的 11.4 ms 來源是 pageable memory | 存疑：實驗 A 同樣是 pageable，空檔只有 0.3 ms；改為待驗證假設 | 4.6 |
