@@ -69,35 +69,59 @@ ncu --kernel-name phase3 --launch-skip 23 --launch-count 1 --set full --import-s
 
 ## 4. Time distribution 與整體 profiling
 
-### 4.1 Time distribution（Nsight Systems，`nvtx_sum`）
+### 4.1 Time distribution（Nsight Systems，`nvtx_pushpop_trace`）
 
-來源：`build\nsys_{p01,c06}_baseline.log`（global memory baseline）、`build\nsys_{p01,c06}_swz.log`（目前版本）。百分比的分母是 7 個區段的加總。
+來源：
+- baseline（global memory 版）：`build\nsys_{p01,c06}_baseline.log`（`nvtx_sum`），所有區段在同一條 thread 依序執行，分母為 7 個區段的加總。
+- 目前版本（`d12831d`：swizzle kernel + CUDA init 另開 thread + host `/O2`）：`reports\{p01,c06}_hostO2_r{1,2,3}.nsys-rep`，同一批各跑 3 次。表中數字取 span 為中位數的那一次（p01 r1、c06 r3），各區段相加等於該次的 span（誤差 0.05 ms）；右欄為 3 次的範圍。區段會重疊，所以分母為 span（第一個區段開始到最後一個區段結束），另一條 thread 上的 `CUDA init` 不計入。
 
-| 區段 | p01 baseline (ms) | p01 目前 (ms) | p01 目前 % | c06 baseline (ms) | c06 目前 (ms) | c06 目前 % |
-|---|---:|---:|---:|---:|---:|---:|
-| read input | 120.781 | 85.527 | 2.63 | 36.028 | 27.742 | 5.12 |
-| build matrix | 1,103.314 | 980.387 | 30.19 | 131.637 | 116.049 | 21.42 |
-| cudaMalloc + CUDA init | 340.875 | 252.872 | 7.79 | 349.874 | 279.193 | 51.53 |
-| H2D copy | 63.140 | 56.215 | 1.73 | 6.194 | 5.396 | 1.00 |
-| compute | 41,025.623 | **1,519.842** | **46.81** | 1,143.877 | **55.223** | **10.19** |
-| D2H copy | 51.272 | 49.230 | 1.52 | 5.710 | 4.476 | 0.83 |
-| write output | 266.417 | 302.911 | 9.33 | 63.854 | 53.718 | 9.91 |
-| **合計** | 42,971.422 | **3,246.984** | 100 | 1,737.174 | **541.797** | 100 |
+| 區段 | p01 baseline (ms) | p01 目前 (ms) | p01 目前 % | p01 3 次範圍 | c06 baseline (ms) | c06 目前 (ms) | c06 目前 % | c06 3 次範圍 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| read input | 120.781 | 34.7 | 1.48 | 27.1–34.7 | 36.028 | 8.7 | 2.11 | 8.7–24.8 |
+| build matrix | 1,103.314 | 233.6 | 9.99 | 173.1–233.6 | 131.637 | 28.5 | 6.93 | 26.4–29.6 |
+| cudaMalloc + CUDA init（baseline）／wait CUDA init + cudaMalloc（目前） | 340.875 | 78.1 | 3.34 | 78.1–106.2 | 349.874 | **240.3** | **58.34** | 225.6–240.3 |
+| （另一條 thread：CUDA init） | — | (345.0) | — | 303.4–345.0 | — | (277.0) | — | 274.5–277.0 |
+| H2D copy | 63.140 | 58.6 | 2.51 | 58.2–62.3 | 6.194 | 5.4 | 1.31 | 5.4–5.9 |
+| compute | 41,025.623 | **1,629.1** | **69.70** | 1,626.9–1,630.2 | 1,143.877 | **57.5** | **13.96** | 56.6–57.5 |
+| D2H copy | 51.272 | 60.6 | 2.59 | 49.7–60.6 | 5.710 | 4.7 | 1.15 | 4.7–8.8 |
+| （`cudaFree`，未標 NVTX） | — | 2.3 | 0.10 | 2.0–2.6 | — | 0.4 | 0.11 | 0.3–0.4 |
+| write output | 266.417 | 240.1 | 10.28 | 240.1–895.7 | 63.854 | 66.3 | 16.08 | 58.8–68.9 |
+| **合計／span** | 42,971.422 | **2,337.1** | 100 | 2,287.3–2,947.1 | 1,737.174 | **412.0** | 100 | 405.8–414.7 |
 
 依題目分類：
 
 | 類別 | 組成 | p01 baseline % | p01 目前 (ms) | p01 目前 % | c06 目前 (ms) | c06 目前 % |
 |---|---|---:|---:|---:|---:|---:|
-| computing | compute | 95.47 | 1,519.842 | 46.81 | 55.223 | 10.19 |
-| memory copy | H2D + D2H | 0.27 | 105.445 | 3.25 | 9.872 | 1.82 |
-| I/O | read input + write output | 0.90 | 388.438 | 11.96 | 81.460 | 15.04 |
-| other | build matrix + cudaMalloc + CUDA init | 3.36 | 1,233.259 | 37.98 | 395.242 | 72.95 |
+| computing | compute | 95.47 | 1,629.1 | 69.70 | 57.5 | 13.96 |
+| memory copy | H2D + D2H | 0.27 | 119.2 | 5.10 | 10.2 | 2.46 |
+| I/O | read input + write output | 0.90 | 274.8 | 11.76 | 74.9 | 18.19 |
+| other | build matrix + wait CUDA init + cudaMalloc + `cudaFree` | 3.36 | 314.0 | 13.43 | 269.3 | 65.37 |
 | communication | — | 0 | 0 | 0 | 0 | 0 |
 
-量測事實：p01 的 `compute` 從 41,025.6 ms 降到 1,519.8 ms（27.0 倍），整個程式從 42,971.4 ms 降到 3,247.0 ms（13.2 倍）。`compute` 以外的區段變化不大（`write output` 在 234.5–302.9 ms 之間浮動），所以現在 p01 有一半以上的時間不在 GPU 計算。（本節為 `0b5d541` 的數據；CUDA 初始化改到另一條 thread 之後的 time distribution 見 4.6。）
+量測事實：
+- p01 的 `compute` 從 41,025.6 ms 降到 1,629.1 ms（25.2 倍），整個程式從 42,971.4 ms 降到 2,337.1 ms（18.4 倍）。目前 p01 有 69.7% 的時間在 GPU 計算。
+- 中間版本：`505c05f`（CUDA init 另開 thread）span 2,994.7 ms（4.6）；host `/O2` 的實驗見 4.7。`0b5d541`（swizzle kernel，所有區段在同一條 thread、host 未最佳化）見下表，4.6 的重疊上限以它計算。
+- 本批 `compute`（1,626.9–1,630.2 ms）比 `0b5d541` 那批（1,519.8 ms）長約 7%；4.7 已確認 `/O2` 不影響 GPU 端，差異來源列在第 11 節。
+- c06 的 CUDA init（約 277 ms）比 `read input` + `build matrix`（約 37 ms）長很多，所以主執行緒大部分時間在等 init，`wait CUDA init` 佔 c06 span 的 58%；p01 在 `/O2` 後也露出 78–106 ms。
+- `write output` 有一次 895.7 ms（p01 r3），其他兩次約 240 ms，推論為磁碟寫入的浮動。
+
+`0b5d541` 版（`build\nsys_{p01,c06}_swz.log`，`nvtx_sum`，分母為 7 個區段的加總）：
+
+| 區段 | p01 (ms) | p01 % | c06 (ms) | c06 % |
+|---|---:|---:|---:|---:|
+| read input | 85.527 | 2.63 | 27.742 | 5.12 |
+| build matrix | 980.387 | 30.19 | 116.049 | 21.42 |
+| cudaMalloc + CUDA init | 252.872 | 7.79 | 279.193 | 51.53 |
+| H2D copy | 56.215 | 1.73 | 5.396 | 1.00 |
+| compute | 1,519.842 | 46.81 | 55.223 | 10.19 |
+| D2H copy | 49.230 | 1.52 | 4.476 | 0.83 |
+| write output | 302.911 | 9.33 | 53.718 | 9.91 |
+| **合計** | **3,246.984** | 100 | **541.797** | 100 |
+
+分類：computing 46.81%／10.19%、memory copy 3.25%／1.82%、I/O 11.96%／15.04%、other（build matrix + cudaMalloc + CUDA init）37.98%／72.95%（p01／c06）。
 
 **分析**
-- 【使用者】`build matrix` 和 `cudaMalloc + CUDA init` 不屬於題目的三類，另列 other。
+- 【使用者】`build matrix` 和 `cudaMalloc + CUDA init` 不屬於題目的三類，另列 other。（註：`505c05f` 之後 other 改為 `build matrix`、`wait CUDA init`、`cudaMalloc` 與未標 NVTX 的 `cudaFree`。）
 - 【使用者】communication 為 0，因為這個實作只有單一 GPU；H2D 和 D2H 歸類在 memory copy。（證據，量測事實：`p01_swz.nsys-rep` 的 `cuda_gpu_trace` 只有 H2D、D2H 各 1 次 memcpy 與 471 個 kernel，沒有 device 之間的傳輸。可補充：每輪 phase1／2／3 用到的 pivot tile 都在同一份 device memory，kernel 直接讀取，不需要搬移。）
 - 【使用者】other 的組成（`505c05f` 後，4.6 thread 版第 1 次）：`build matrix` 1,039.0 ms。原本的 `cudaMalloc + CUDA init` 拆開後，`cudaMalloc` 只剩 1.0 ms；`CUDA init` 279.5 ms 由另一條 CPU thread 執行，與 `read input` + `build matrix` 重疊，所以時間被隱藏。（證據，量測事實：`wait CUDA init` 為 0.0 ms；279.5 ms < 87.6 + 1,039.0 = 1,126.6 ms。）
 - 【使用者】值不值得優化：以 Amdahl 定律，`build matrix` 佔 span 的 34.69%，降為 0 時上限為 1 / (1 − 0.3469) ≈ 1.53 倍。但 `build matrix` 消失後 CUDA init 就不再被隱藏，主執行緒在 `read input` 之後要等 279.5 − 87.6 ms，所以實際上限不是 1.53 倍。
@@ -184,7 +208,7 @@ ncu --kernel-name phase3 --launch-skip 23 --launch-count 1 --set full --import-s
 | compute → D2H | 全部 | 最後一輪 phase3 會更新所有 tile |
 | D2H → write output | 部分 | 傳回的列可先寫出 |
 
-**重疊的收益上限**（兩段完全重疊最多省下較短的一段；p01 數據取自 4.1）：
+**重疊的收益上限**（兩段完全重疊最多省下較短的一段；p01 數據取自 4.1 的 `0b5d541` 版表格）：
 
 | 組合 | 上限 | 佔 3,247.0 ms |
 |---|---:|---:|
@@ -660,14 +684,14 @@ G = 8 的 `--set full`：Duration 750.24 µs；DRAM Throughput 79.31%；**L1/TEX
 
 ## 10. 目前瓶頸與剩餘工作
 
-目前狀態（量測事實）：p01 `compute` 1,519.8 ms、Integer GOPS 1,315.9；phase3 佔 kernel 時間 91.1%，c06 單次 phase3 的 L1/TEX 89.26%、DRAM 79.31%（實際上限的約 90%）；phase2 佔 8.3%、phase1 佔 0.6%（c06 為 24.1%、6.0%）。整個程式中 `compute` 只佔 p01 的 46.81%，CPU 端的 `build matrix` 佔 30.19%（4.1）。CUDA 初始化改到另一條 thread 後（`505c05f`），p01 span 約 3,000 ms，`compute` 佔 51.20%、`build matrix` 佔 34.69%（4.6）。
+目前狀態（量測事實）：p01 `compute` 1,519.8 ms、Integer GOPS 1,315.9；phase3 佔 kernel 時間 91.1%，c06 單次 phase3 的 L1/TEX 89.26%、DRAM 79.31%（實際上限的約 90%）；phase2 佔 8.3%、phase1 佔 0.6%（c06 為 24.1%、6.0%）。整個程式中 `compute` 在 `0b5d541` 只佔 p01 的 46.81%、CPU 端的 `build matrix` 佔 30.19%；CUDA 初始化改到另一條 thread 後（`505c05f`）span 約 3,000 ms，`compute` 51.20%、`build matrix` 34.69%（4.6）；host 加 `/O2` 後（`d12831d`）p01 span 2,337.1 ms，`compute` 69.70%、`build matrix` 9.99%、`write output` 10.28%、`wait CUDA init` + `cudaMalloc` 3.34%（4.1）。注意本批 `compute` 1,629.1 ms 比 `0b5d541` 那批長約 7%（第 11 節）。
 
 候選（推論，未驗證）：
 
 1. **k 分段載入以支援 BF = 128**：兩個 tile 整塊放進 shared memory 需 128 KB，超過 64 KB；改為每次載入一段 k，輪數減半、矩陣進出 DRAM 的次數也減半。但 L1/TEX 也接近滿載，做之前要先估算 shared wavefront 是否成為新瓶頸；需要重新設計 register 分配，工作量大。
 2. **補 BF = 16 資料點**：需 `-Define BF=16,BLOCK_X_P3=16`（否則 `BF/BLOCK_X_P3` 為 0，程式會壞）。
 3. **phase1 改用 shared memory**：結構與 phase2 相同，但只佔 p01 的 0.6%，價值低。BF = 32 時 phase1 總時間較短（p01 9.157 → 4.974 ms），BF 越大序列部分越長（量測事實，8.1），但 BF = 64 時仍只佔約 0.5%。
-4. **CPU 端 `build matrix`**：p01 佔 30%（`505c05f` 後 34.7%）。主因是 host 程式碼沒有開最佳化：`-HostFlags /O2` 後 `build matrix` 177–216 ms、p01 D2H 結束時間提早約 880 ms（4.7）。`build.ps1` 已預設加 `/O2`，目前版本的 time distribution 以 4.7 的 `/O2` 欄為準；之後剩下的方向為 scatter 的隨機寫入（約 107 ms）、露出來的 CUDA init 等待（75–101 ms）與在 GPU 上建矩陣（4.1）。
+4. **CPU 端 `build matrix`**：p01 佔 30%（`505c05f` 後 34.7%）。主因是 host 程式碼沒有開最佳化：`-HostFlags /O2` 後 `build matrix` 177–216 ms、p01 D2H 結束時間提早約 880 ms（4.7）。`build.ps1` 已預設加 `/O2`，目前版本的 time distribution 見 4.1（p01 span 2,337.1 ms、`compute` 69.70%、`build matrix` 9.99%）；之後剩下的方向為 scatter 的隨機寫入（約 107 ms）、露出來的 CUDA init 等待（75–101 ms）與在 GPU 上建矩陣（4.1）。
 5. 多 GPU／多節點版的概念討論（未實作、未實測）。
 
 不做：
@@ -683,7 +707,7 @@ G = 8 的 `--set full`：Duration 750.24 µs；DRAM Throughput 79.31%；**L1/TEX
 |---|---|---|
 | H2D 投影比 CPU 端區段短 11.4 ms 的原因。`cudaMalloc` 與 H2D 相隔約 1 s 時只有 0.3 ms（4.6 實驗 A，單次），推測是 `cudaMalloc` 後第一次使用 device 記憶體的準備成本，而非 pageable memory | 4.4、4.6 | 重跑實驗 A；在 `cudaMalloc` 與 H2D 之間插入固定等待；或改用 `cudaMallocHost` |
 | `/O2` 後 `read input` 從 96–113 降到 27–40 ms 的原因（`edges.resize` 的初始化 vs OS 檔案快取） | 4.7 | 在 `read_graph` 內分開計時 `resize` 與 `fread` |
-| 4.7 那批 `compute`（1,629–1,632 ms）比 4.6（1,532–1,535 ms）長約 6% | 4.7 | nsys `--gpu-metrics-devices` 取樣 SM 時脈 |
+| 4.7 與 4.1 目前版本那兩批 `compute`（1,627–1,632 ms）比 4.6（1,532–1,535 ms）長約 6% | 4.1、4.7 | nsys `--gpu-metrics-devices` 取樣 SM 時脈 |
 | ~~swizzle 版 nsys 平均比 `ncu` 長 8%~~：已解答，`ncu` 鎖定 SM 1,557 MHz、平常執行約 1,395 MHz | 4.4 | — |
 | baseline `ncu`（23.94 ms）比 nsys 平均（23.29 ms）長 2.8%：baseline 受 DRAM 限制，時脈不應有影響 | 4.4 | 用 `--clock-control none`、`--cache-control none` 量 baseline 執行檔 |
 | 平常執行時 SM 只到約 1,395 MHz，低於 `ncu` 鎖定的 1,557 MHz 與 `nvidia-smi` 的最高 2,100 MHz（功耗、溫度或 boost 策略，未經查證） | 4.4 | nsys `--gpu-metrics-devices` 取樣整段執行的 SM 時脈；或 `nvidia-smi --query-gpu=clocks.sm,power.draw,temperature.gpu,clocks_throttle_reasons.active -lms 100` |
