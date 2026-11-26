@@ -99,7 +99,11 @@ ncu --kernel-name phase3 --launch-skip 23 --launch-count 1 --set full --import-s
 **分析**
 - 【使用者】`build matrix` 和 `cudaMalloc + CUDA init` 不屬於題目的三類，另列 other。
 - 【使用者】communication 為 0，因為這個實作只有單一 GPU；H2D 和 D2H 歸類在 memory copy。（證據，量測事實：`p01_swz.nsys-rep` 的 `cuda_gpu_trace` 只有 H2D、D2H 各 1 次 memcpy 與 471 個 kernel，沒有 device 之間的傳輸。可補充：每輪 phase1／2／3 用到的 pivot tile 都在同一份 device memory，kernel 直接讀取，不需要搬移。）
-- 【待寫】other 的組成說明：`build matrix`（CPU 端）在 p01 為 980 ms，佔 30%，約是 GPU 計算時間的 65%；是否值得優化，以及它能否與 GPU 計算重疊。
+- 【使用者】other 的組成（`505c05f` 後，4.6 thread 版第 1 次）：`build matrix` 1,039.0 ms。原本的 `cudaMalloc + CUDA init` 拆開後，`cudaMalloc` 只剩 1.0 ms；`CUDA init` 279.5 ms 由另一條 CPU thread 執行，與 `read input` + `build matrix` 重疊，所以時間被隱藏。（證據，量測事實：`wait CUDA init` 為 0.0 ms；279.5 ms < 87.6 + 1,039.0 = 1,126.6 ms。）
+- 【使用者】值不值得優化：以 Amdahl 定律，`build matrix` 佔 span 的 34.69%，降為 0 時上限為 1 / (1 − 0.3469) ≈ 1.53 倍。但 `build matrix` 消失後 CUDA init 就不再被隱藏，主執行緒在 `read input` 之後要等 279.5 − 87.6 ms，所以實際上限不是 1.53 倍。
+- 【參考答案，待改寫】修正後的上限：等待 279.5 − 87.6 = 191.9 ms，span 2,994.7 − 1,039.0 + 191.9 = 2,147.6 ms，上限約 2,994.7 ÷ 2,147.6 ≈ **1.39 倍**（推論，假設其他區段不變）。
+- 【使用者】`build matrix` 慢的原因猜測：cache miss、page fault。實驗結果（4.7）：兩者都存在，但主因是 host 程式碼沒有開編譯最佳化。
+- 【參考答案，待改寫】能否與 GPU 計算重疊：不能。輸入的邊沒有排序，最後一條邊可能落在任何 tile，所以要等全部的邊都寫完，才有任何 tile 是最終值；即使邊已排序，第 0 輪 phase2 就需要整個第 0 個 tile 欄，phase3 需要全部 tile（推論，依演算法與 `make_dist_matrix`）。剩下的選項：(1) 與 H2D 分塊重疊，上限 56.9 ms，且需要先把邊依 src 分組（4.6 依賴表的「部分」隱含這個前提）；(2) 在 CPU 端加速（4.7：`/O2`、減少隨機寫入、多執行緒）；(3) 把建矩陣搬到 GPU：H2D 改傳邊表（p01.in 60.0 MB，約為矩陣的 1/6.7），kernel 填 INF 與對角線後 scatter 邊；重複的邊要取最小值，scatter 需用 `atomicMin`。粗估：填 403.8 MB 以 6.6 實測約 110 GB/s 約 4 ms，傳 60 MB 以目前 H2D 約 8.9 GB/s 約 7 ms，scatter 數 ms（推論，未實作）。屬核心程式碼，由使用者決定是否實作。
 
 ### 4.2 Kernel 佔比（Nsight Systems，`cuda_gpu_kern_sum`）
 
@@ -239,6 +243,50 @@ thread 版第 1 次的 time distribution（主執行緒；分母為 span 2,994.7
 - 【參考答案，待改寫】`build matrix` 沒有明顯被 init thread 拖慢（thread 版 1,015–1,039 ms，對照 1,004–1,020 ms），但只有兩次樣本，無法排除 10–30 ms 的資源競爭。
 - 【參考答案，待改寫】改完後主執行緒的關鍵路徑是 `compute`（51.2%）與 `build matrix`（34.7%）；`build matrix` 是 CPU 端單執行緒的工作，已成為第二大成本。
 - 【待驗證假設】H2D 前的約 11.4 ms 空檔只在 `cudaMalloc` 緊接 H2D 時出現，實驗 A 兩者相隔約 1 s 時只有 0.3 ms，而四個版本的來源都是 pageable memory。推測空檔是 `cudaMalloc` 之後第一次使用該 device 記憶體的準備成本，而不是 pageable memory 本身（未經查證，實驗 A 只有一次）。驗證：重跑實驗 A 確認可重現；在 thread 版的 `cudaMalloc` 與 H2D 之間插入固定等待（例如 100 ms），看空檔是否消失；或改用 `cudaMallocHost` 比較。
+
+### 4.7 `build matrix` 的 CPU 成本：編譯最佳化、page fault 與隨機寫入
+
+**host 編譯選項（量測事實，`nvcc -dryrun`）**：`build.ps1` 的預設指令下，nvcc 最後編譯 host 程式碼的 `cl.exe` 指令列只有 `-nologo -c -TP -DCUDA_DOUBLE_MATH_FUNCTIONS -EHsc /utf-8` 與 include 路徑，**沒有任何 `/O` 選項**。MSVC 沒有指定 `/O` 時不做最佳化（未經查證，屬 Microsoft 文件；下表 `/O2` 前後的差距支持這點）。`-Xcompiler /O2` 只影響 host 程式碼，不影響 device 程式碼。
+
+**實驗 1：`make_dist_matrix` 各步驟（`tools/bench_build.cpp`，p01，`std::chrono` 計時，page fault 由 `GetProcessMemoryInfo` 的 `PageFaultCount` 前後相減；3 次平均，單位 ms）**
+
+| 步驟 | 內容 | 預設（無 `/O`） | `/O2` | page faults |
+|---|---|---:|---:|---:|
+| alloc+fill | `std::vector<int>(n*n, INF)`，剛配置的記憶體第一次寫入 | 835.5 | 63.9 | 98,791–98,792 |
+| diag | 對角線填 0 | 0.1 | 0.2 | 0 |
+| scatter | 500 萬條邊，依輸入檔順序（隨機位置） | 157.6 | 107.4 | 0 |
+| refill | 同一個 vector 再 `std::fill` 一次（已寫過的記憶體） | 144.0 | 16.9 | 0 |
+| scatter2 | refill 後再 scatter（同工作量） | 157.1 | 106.2 | 0 |
+| scatter_sorted | 邊依 (src, dst) 排序後 scatter（排序不計時） | 54.5 | 31.5 | 0 |
+| **合計**（alloc+fill + diag + scatter） | | **993.2** | **171.5** | |
+
+page fault 次數 ≈ 403,849,216 bytes ÷ 4,096 = 98,596 個 4 KB page，只發生在第一次寫入（量測事實）。
+
+**實驗 2：整個程式（nsys，p01，同一批交錯執行 預設→`/O2`→預設→`/O2`；`reports\p01_{def,o2}_r{1,2}.nsys-rep`；單位 ms）**
+
+| 區段 | 預設 r1 | 預設 r2 | `/O2` r1 | `/O2` r2 |
+|---|---:|---:|---:|---:|
+| read input | 112.6 | 95.6 | 39.5 | 26.5 |
+| CUDA init（另一條 thread） | 411.4 | 314.6 | 330.6 | 303.5 |
+| build matrix | 1,130.0 | 1,077.3 | **216.3** | **176.9** |
+| wait CUDA init | 0.0 | 0.0 | **75.3** | **100.6** |
+| H2D copy | 59.9 | 57.5 | 64.3 | 65.8 |
+| compute | 1,629.8 | 1,629.4 | 1,632.2 | 1,629.0 |
+| D2H copy | 48.0 | 51.4 | 49.7 | 52.9 |
+| write output | 284.7 | 458.6 | 372.3 | 581.1 |
+| D2H 結束時間 | 2,981.2 | 2,912.0 | **2,078.3** | **2,052.5** |
+| **span** | 3,268.3 | 3,373.3 | **2,453.4** | **2,637.0** |
+
+正確性：`build\apsp_o2.exe` 通過 c01–c06；p01 輸出與預設版逐位元組相同。
+
+**分析**
+- 【參考答案，待改寫】主因是 host 程式碼沒有最佳化：`/O2` 讓 `make_dist_matrix` 從 993.2 降到 171.5 ms（5.8 倍），整個程式中 `build matrix` 從 1,077–1,130 降到 177–216 ms。最大的差距在 alloc+fill（835.5 → 63.9 ms）：不開最佳化時，`std::vector` 建構子逐元素填值的程式碼沒有被 inline 與向量化（推論，未看組合語言；同樣不開最佳化，`std::fill` 只要 144.0 ms，表示兩種填法產生的程式碼差很多）。
+- 【參考答案，待改寫】page fault 存在但不是主因：`/O2` 下 alloc+fill − refill = 63.9 − 16.9 = 47.0 ms，約 98,800 次 page fault，平均約 0.48 µs 一次，佔原本 `build matrix` 的約 4.5%（推論：假設兩者的差全部來自 page fault）。
+- 【參考答案，待改寫】cache miss 存在，影響 scatter：同樣的 500 萬次寫入，隨機位置 107.4 ms、排序後 31.5 ms（`/O2`），每條邊約 21.5 vs 6.3 ns。隨機位置分散在 403.8 MB 中，大多不在 cache，且 4 KB page 的 TLB 也會 miss；本實驗沒有區分兩者（推論）。排序後同一列的邊落在相鄰位置，能重用 cache line。`/O2` 之後 scatter（107.4 ms）已比填值（63.9 ms）貴，成為 `make_dist_matrix` 最大的一步。
+- 【參考答案，待改寫】`build matrix` 縮短後 CUDA init 不再被完全隱藏：`wait CUDA init` 從 0 變成 75–101 ms，與 4.1 的推論一致（CUDA init 303–331 ms 比 `read input` + `build matrix` 的 203–256 ms 長）。
+- 【參考答案，待改寫】排除雜訊大的 `write output`（285–581 ms，磁碟寫入），D2H 結束時間提早約 860–900 ms（2,912–2,981 → 2,053–2,078 ms）。`compute` 兩版相同（1,629–1,632 ms），表示 `-Xcompiler /O2` 沒有改變 GPU 端。
+- 【待驗證假設】`read input` 也從 96–113 降到 27–40 ms。推測 `read_graph` 的 `edges.resize(E)` 要先把 60 MB 的 `Edge` 初始化為 0，這段也是沒最佳化的逐元素程式碼；但第二次以後檔案也在 OS 快取中。驗證：在 `read_graph` 內分開計時 `resize` 與 `fread`。
+- 【待驗證假設】本批 `compute` 為 1,629–1,632 ms，比 4.6 的 1,532–1,535 ms 長約 6%，兩種編譯結果相同，所以與 `/O2` 無關；可能是 GPU 時脈或溫度不同（未經查證）。驗證：nsys `--gpu-metrics-devices` 取樣 SM 時脈。
 
 ## 5. 優化總覽
 
@@ -619,7 +667,7 @@ G = 8 的 `--set full`：Duration 750.24 µs；DRAM Throughput 79.31%；**L1/TEX
 1. **k 分段載入以支援 BF = 128**：兩個 tile 整塊放進 shared memory 需 128 KB，超過 64 KB；改為每次載入一段 k，輪數減半、矩陣進出 DRAM 的次數也減半。但 L1/TEX 也接近滿載，做之前要先估算 shared wavefront 是否成為新瓶頸；需要重新設計 register 分配，工作量大。
 2. **補 BF = 16 資料點**：需 `-Define BF=16,BLOCK_X_P3=16`（否則 `BF/BLOCK_X_P3` 為 0，程式會壞）。
 3. **phase1 改用 shared memory**：結構與 phase2 相同，但只佔 p01 的 0.6%，價值低。BF = 32 時 phase1 總時間較短（p01 9.157 → 4.974 ms），BF 越大序列部分越長（量測事實，8.1），但 BF = 64 時仍只佔約 0.5%。
-4. **CPU 端 `build matrix`**：p01 佔 30%（`505c05f` 後 34.7%），不在 GPU 上；是否處理由使用者決定（見 4.1 的【待寫】）。
+4. **CPU 端 `build matrix`**：p01 佔 30%（`505c05f` 後 34.7%）。主因是 host 程式碼沒有開最佳化：`-HostFlags /O2` 後 `build matrix` 177–216 ms、p01 D2H 結束時間提早約 880 ms（4.7）。`build.ps1` 是否預設加 `/O2` 由使用者決定；之後剩下的方向為 scatter 的隨機寫入（約 107 ms）、露出來的 CUDA init 等待（75–101 ms）與在 GPU 上建矩陣（4.1）。
 5. 多 GPU／多節點版的概念討論（未實作、未實測）。
 
 不做：
@@ -634,6 +682,8 @@ G = 8 的 `--set full`：Duration 750.24 µs；DRAM Throughput 79.31%；**L1/TEX
 | 問題 | 出處 | 驗證方式 |
 |---|---|---|
 | H2D 投影比 CPU 端區段短 11.4 ms 的原因。`cudaMalloc` 與 H2D 相隔約 1 s 時只有 0.3 ms（4.6 實驗 A，單次），推測是 `cudaMalloc` 後第一次使用 device 記憶體的準備成本，而非 pageable memory | 4.4、4.6 | 重跑實驗 A；在 `cudaMalloc` 與 H2D 之間插入固定等待；或改用 `cudaMallocHost` |
+| `/O2` 後 `read input` 從 96–113 降到 27–40 ms 的原因（`edges.resize` 的初始化 vs OS 檔案快取） | 4.7 | 在 `read_graph` 內分開計時 `resize` 與 `fread` |
+| 4.7 那批 `compute`（1,629–1,632 ms）比 4.6（1,532–1,535 ms）長約 6% | 4.7 | nsys `--gpu-metrics-devices` 取樣 SM 時脈 |
 | ~~swizzle 版 nsys 平均比 `ncu` 長 8%~~：已解答，`ncu` 鎖定 SM 1,557 MHz、平常執行約 1,395 MHz | 4.4 | — |
 | baseline `ncu`（23.94 ms）比 nsys 平均（23.29 ms）長 2.8%：baseline 受 DRAM 限制，時脈不應有影響 | 4.4 | 用 `--clock-control none`、`--cache-control none` 量 baseline 執行檔 |
 | 平常執行時 SM 只到約 1,395 MHz，低於 `ncu` 鎖定的 1,557 MHz 與 `nvidia-smi` 的最高 2,100 MHz（功耗、溫度或 boost 策略，未經查證） | 4.4 | nsys `--gpu-metrics-devices` 取樣整段執行的 SM 時脈；或 `nvidia-smi --query-gpu=clocks.sm,power.draw,temperature.gpu,clocks_throttle_reasons.active -lms 100` |
