@@ -18,7 +18,7 @@
 | CUDA Toolkit | 13.4 |
 | Nsight Systems | 2026.3.2 |
 | Nsight Compute | 2026.3.0 |
-| 編譯 | `nvcc -arch=sm_75 -lineinfo -res-usage -Xcompiler /utf-8`（`build.ps1`） |
+| 編譯 | `nvcc -arch=sm_75 -lineinfo -res-usage -Xcompiler /utf-8 -Xcompiler /O2`（`build.ps1`）。`/O2` 在 4.7 之後才加入：4.7 以前各節的 host 端區段（`read input`、`build matrix`）是在 host 未最佳化時量的；GPU 端不受影響 |
 | BF | 64（第 8 節另測 32） |
 
 測資：
@@ -667,7 +667,7 @@ G = 8 的 `--set full`：Duration 750.24 µs；DRAM Throughput 79.31%；**L1/TEX
 1. **k 分段載入以支援 BF = 128**：兩個 tile 整塊放進 shared memory 需 128 KB，超過 64 KB；改為每次載入一段 k，輪數減半、矩陣進出 DRAM 的次數也減半。但 L1/TEX 也接近滿載，做之前要先估算 shared wavefront 是否成為新瓶頸；需要重新設計 register 分配，工作量大。
 2. **補 BF = 16 資料點**：需 `-Define BF=16,BLOCK_X_P3=16`（否則 `BF/BLOCK_X_P3` 為 0，程式會壞）。
 3. **phase1 改用 shared memory**：結構與 phase2 相同，但只佔 p01 的 0.6%，價值低。BF = 32 時 phase1 總時間較短（p01 9.157 → 4.974 ms），BF 越大序列部分越長（量測事實，8.1），但 BF = 64 時仍只佔約 0.5%。
-4. **CPU 端 `build matrix`**：p01 佔 30%（`505c05f` 後 34.7%）。主因是 host 程式碼沒有開最佳化：`-HostFlags /O2` 後 `build matrix` 177–216 ms、p01 D2H 結束時間提早約 880 ms（4.7）。`build.ps1` 是否預設加 `/O2` 由使用者決定；之後剩下的方向為 scatter 的隨機寫入（約 107 ms）、露出來的 CUDA init 等待（75–101 ms）與在 GPU 上建矩陣（4.1）。
+4. **CPU 端 `build matrix`**：p01 佔 30%（`505c05f` 後 34.7%）。主因是 host 程式碼沒有開最佳化：`-HostFlags /O2` 後 `build matrix` 177–216 ms、p01 D2H 結束時間提早約 880 ms（4.7）。`build.ps1` 已預設加 `/O2`，目前版本的 time distribution 以 4.7 的 `/O2` 欄為準；之後剩下的方向為 scatter 的隨機寫入（約 107 ms）、露出來的 CUDA init 等待（75–101 ms）與在 GPU 上建矩陣（4.1）。
 5. 多 GPU／多節點版的概念討論（未實作、未實測）。
 
 不做：

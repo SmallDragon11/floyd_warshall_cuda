@@ -3,7 +3,8 @@
 #   .\build.ps1                         # 編譯 src/apsp.cu
 #   .\build.ps1 -Define BF=64           # 等同在程式中 #define BF 64
 #   .\build.ps1 -Source src/foo.cu -Output build/foo.exe
-#   .\build.ps1 -Source tools/ref.cpp -Output build/ref.exe -HostFlags /O2,/openmp
+#   .\build.ps1 -Source tools/ref.cpp -Output build/ref.exe -HostFlags /openmp
+#   host 程式碼一律以 /O2 編譯；-HostFlags 為額外的 cl.exe 選項
 param(
     [string]$Source = "src/apsp.cu",
     [string]$Output = "build/apsp.exe",
@@ -31,6 +32,7 @@ $nvccArgs = @(
     "-lineinfo",              # 產生 device 端行號資訊，讓 Nsight Compute 對應到原始碼
     "-res-usage",             # 編譯時印出每個 kernel 的 register／shared memory 用量
     "-Xcompiler", "/utf-8",   # cl.exe 以 UTF-8 讀原始碼，避免 C4819 與中文註解亂碼
+    "-Xcompiler", "/O2",      # host 程式碼最佳化；nvcc 預設不傳任何 /O 給 cl.exe（報告 4.7）
     "-o", $Output
 ) + ($Define | ForEach-Object { "-D$_" }) + ($HostFlags | ForEach-Object { "-Xcompiler", $_ }) + @($Source)
 
